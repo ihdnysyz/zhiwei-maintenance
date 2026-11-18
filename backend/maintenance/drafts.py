@@ -1,0 +1,278 @@
+import json
+import re
+import subprocess
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from typing import Literal
+
+from fastapi import APIRouter, Depends, File, Request, UploadFile
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .common import actor, device_for, fail, get_db, need, own, revision
+from .conversations import session_turns, turn_view
+from .db import Record, add, audit, cfg, digest, enqueue, find, now, records, uid
+from .knowledge import codes_in
+from .library import file_response
+
+router = APIRouter()
+FIELDS = {"symptom": "故障现象", "faultCode": "故障码", "cause": "已确认原因",
+          "actions": "实际处置", "result": "现场结果"}
+REQUIRED = ("symptom", "cause", "actions", "result")
+ATTACHMENTS = {".pdf": ("application/pdf", b"%PDF-"), ".png": ("image/png", b"\x89PNG\r\n\x1a\n"),
+               ".jpg": ("image/jpeg", b"\xff\xd8\xff"), ".jpeg": ("image/jpeg", b"\xff\xd8\xff")}
+
+
+class DraftCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sessionId: str
+
+
+class DraftPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision: int
+    fields: dict[Literal["symptom", "faultCode", "cause", "actions", "result"], str]
+
+    @field_validator("fields")
+    @classmethod
+    def validate_fields(cls, value):
+        if any(len(text) > 8000 for text in value.values()):
+            raise ValueError("每个字段不超过 8000 字")
+        return {key: text.strip() for key, text in value.items()}
+
+
+class Revision(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision: int
+
+
+class Register(Revision):
+    number: str = Field(min_length=3, max_length=64)
+
+
+def attachments(db, org, draft_id):
+    return list(db.scalars(records(org, "attachment").where(Record.owner == draft_id).order_by(Record.created)))
+
+
+def view(db, user, row):
+    session = find(db, user.org, "session", id=row.data["sessionId"])
+    ref = []
+    if session and row.data.get("turnId"):
+        turn = find(db, user.org, "turn", id=row.data["turnId"])
+        if turn:
+            ref = turn_view(db, user, turn, session).get("citations", [])
+    return {**row.view("snapshot"), "references": ref,
+            "attachments": [item.view() for item in attachments(db, user.org, row.id)]}
+
+
+def mutable(row):
+    if row.status in {"linked", "submitting"}:
+        fail(409, "DRAFT_LOCKED", "工单已登记或提交，当前版本已锁定")
+
+
+@router.get("/drafts")
+def list_drafts(user=Depends(actor), db=Depends(get_db, scope="function")):
+    return [row.view("snapshot", "changes") for row in db.scalars(records(user.org, "draft").where(
+        Record.owner == user.key).order_by(Record.updated.desc()).limit(100))]
+
+
+@router.post("/drafts", status_code=201)
+def create(body: DraftCreate, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    session = own(db, user, "session", body.sessionId, lock=True)
+    device = device_for(db, user, session.data["deviceId"])
+    turns = session_turns(db, user.org, session)
+    if not turns:
+        fail(422, "MISSING_CONTEXT", "请先描述现场情况")
+    existing = find(db, user.org, "draft", key=session.id)
+    if existing:
+        return view(db, user, existing)
+    last = turns[-1]
+    symptom = "\n".join(row.data["text"] for row in turns)[-8000:]
+    codes = codes_in(last.data["text"]) - codes_in(device["number"])
+    fault = next(iter(codes)) if len(codes) == 1 else ""
+    fields = {"symptom": symptom, "faultCode": fault, "cause": "", "actions": "", "result": ""}
+    row = add(db, user.org, "draft", key=session.id, owner=user.key, status="draft", sessionId=session.id,
+              turnId=last.id, device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
+              fields=fields, origins={"symptom": "会话现场描述", "faultCode": "最近一轮现场描述" if fault else "",
+                                     "device": "设备台账"}, changes=[], snapshot=None)
+    audit(db, user.org, user.key, "生成工单草稿", row.id, request.state.request_id)
+    return view(db, user, row)
+
+
+@router.get("/drafts/{draft_id}")
+def get_draft(draft_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
+    return view(db, user, own(db, user, "draft", draft_id))
+
+
+@router.patch("/drafts/{draft_id}")
+def patch_draft(draft_id: str, body: DraftPatch, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, body.revision)
+    mutable(row)
+    device_for(db, user, row.data["device"]["id"])
+    old, origins, changes = row.data["fields"], row.data["origins"].copy(), row.data["changes"].copy()
+    for key, value in body.fields.items():
+        if old[key] != value:
+            changes.append(dict(field=key, before=old[key], after=value, actor=user.key, at=now(), revision=row.rev + 1))
+            origins[key] = "经办人填写"
+    if len(changes) != len(row.data["changes"]):
+        row.change("draft", fields={**old, **body.fields}, origins=origins, changes=changes, snapshot=None)
+        audit(db, user.org, user.key, "编辑工单草稿", row.id, request.state.request_id)
+    return view(db, user, row)
+
+
+@router.post("/drafts/{draft_id}/attachments", status_code=201)
+def attach(draft_id: str, revisionId: int, file: UploadFile = File(), user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, revisionId)
+    mutable(row)
+    device_for(db, user, row.data["device"]["id"])
+    if len(attachments(db, user.org, row.id)) >= 10:
+        fail(422, "ATTACHMENT_LIMIT", "每个草稿最多 10 件附件")
+    filename = Path((file.filename or "").replace("\\", "/")).name[:180]
+    spec = ATTACHMENTS.get(Path(filename).suffix.lower())
+    blob = file.file.read(20 * 1024 * 1024 + 1)
+    if not spec or not blob.startswith(spec[1]) or len(blob) > 20 * 1024 * 1024:
+        fail(422, "INVALID_ATTACHMENT", "附件须为不超过 20 MiB 的 PDF、PNG 或 JPEG")
+    if cfg.clamav_command:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "attachment"
+            path.write_bytes(blob)
+            try:
+                check = subprocess.run([cfg.clamav_command, "--no-summary", str(path)], timeout=30, capture_output=True)
+            except (OSError, subprocess.TimeoutExpired):
+                fail(503, "SCAN_UNAVAILABLE", "附件扫描服务暂不可用")
+            if check.returncode:
+                fail(422, "SCAN_FAILED", "附件扫描未通过")
+    elif not user.data.get("demo"):
+        fail(503, "SCAN_UNAVAILABLE", "请配置附件扫描服务")
+    add(db, user.org, "attachment", owner=row.id, status="ready", filename=filename,
+        media=spec[0], bytes=len(blob), sha256=digest(blob), blob=blob)
+    row.change("draft", snapshot=None)
+    db.flush()
+    return view(db, user, row)
+
+
+@router.get("/drafts/{draft_id}/attachments/{attachment_id}")
+def read_attachment(draft_id: str, attachment_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id)
+    device_for(db, user, row.data["device"]["id"])
+    asset = need(find(db, user.org, "attachment", id=attachment_id))
+    if asset.owner != draft_id:
+        fail(404, "NOT_FOUND", "附件不存在")
+    return file_response(asset.blob, asset.data["filename"], asset.data["media"])
+
+
+@router.delete("/drafts/{draft_id}/attachments/{attachment_id}")
+def remove_attachment(draft_id: str, attachment_id: str, revisionId: int, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, revisionId)
+    mutable(row)
+    device_for(db, user, row.data["device"]["id"])
+    asset = need(find(db, user.org, "attachment", id=attachment_id))
+    if asset.owner != draft_id:
+        fail(404, "NOT_FOUND", "附件不存在")
+    db.delete(asset)
+    row.change("draft", snapshot=None)
+    db.flush()
+    return view(db, user, row)
+
+
+@router.post("/drafts/{draft_id}/confirm")
+def confirm(draft_id: str, body: Revision, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, body.revision)
+    mutable(row)
+    if row.status in {"confirmed", "exported"}:
+        return view(db, user, row)
+    device = device_for(db, user, row.data["device"]["id"])
+    missing = [FIELDS[key] for key in REQUIRED if not row.data["fields"][key].strip()]
+    if missing:
+        fail(422, "REQUIRED_FIELDS", "请填写：" + "、".join(missing))
+    references = view(db, user, row)["references"]
+    snapshot = dict(draftId=row.id, confirmedAt=now(), confirmedBy=user.key, version=row.rev + 1,
+                    device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
+                    fields=row.data["fields"], fieldOrigins=row.data["origins"],
+                    references=[{key: ref[key] for key in ("sourceId", "number", "version", "position", "id")} for ref in references],
+                    attachments=[item.view() for item in attachments(db, user.org, row.id)])
+    row.change("confirmed", snapshot=snapshot)
+    audit(db, user.org, user.key, "确认工单快照", row.id, request.state.request_id)
+    return view(db, user, row)
+
+
+@router.post("/drafts/{draft_id}/export")
+def export(draft_id: str, body: Revision, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, body.revision)
+    device_for(db, user, row.data["device"]["id"])
+    if row.status not in {"confirmed", "exported", "linked"}:
+        fail(409, "CONFIRM_REQUIRED", "请先人工确认工单")
+    if row.status == "confirmed":
+        row.change("exported")
+    snapshot = {**row.data["snapshot"]}
+    current = {ref["id"] for ref in view(db, user, row)["references"]}
+    snapshot["references"] = [ref for ref in snapshot["references"] if ref["id"] in current]
+    audit(db, user.org, user.key, "导出工单", row.id, request.state.request_id)
+    return file_response(json.dumps(snapshot, ensure_ascii=False, indent=2).encode(), f"工单-{row.id[:8]}.json",
+                         "application/json")
+
+
+@router.post("/drafts/{draft_id}/register")
+def register(draft_id: str, body: Register, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, body.revision)
+    device_for(db, user, row.data["device"]["id"])
+    if row.status != "exported":
+        fail(409, "EXPORT_REQUIRED", "请先导出已确认的工单")
+    number = body.number.strip()
+    if not re.fullmatch(cfg.allowed_ticket_pattern, number):
+        fail(422, "INVALID_TICKET", "外部工单编号格式不正确")
+    if find(db, user.org, "ticket", key=number.upper()):
+        fail(409, "DUPLICATE_TICKET", "该外部单号已登记")
+    add(db, user.org, "ticket", key=number.upper(), owner=row.id)
+    row.change("linked", externalNumber=number)
+    audit(db, user.org, user.key, "登记外部工单号", row.id, request.state.request_id)
+    return view(db, user, row)
+
+
+@router.post("/drafts/{draft_id}/submit", status_code=202)
+def submit(draft_id: str, body: Revision, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    device_for(db, user, row.data["device"]["id"])
+    existing = find(db, user.org, "submission", key=row.id)
+    if existing:
+        return existing.view("payload")
+    revision(row, body.revision)
+    if not cfg.workorder_enabled or not cfg.workorder_url or user.data.get("demo"):
+        fail(409, "GATE_CLOSED", "正式工单回写尚未通过准入，请使用导出及外部单号登记")
+    if row.status not in {"confirmed", "exported"}:
+        fail(409, "CONFIRM_REQUIRED", "请先确认工单")
+    snapshot = {**row.data["snapshot"]}
+    current = {ref["id"] for ref in view(db, user, row)["references"]}
+    snapshot["references"] = [ref for ref in snapshot["references"] if ref["id"] in current]
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    submission = add(db, user.org, "submission", key=row.id, owner=user.key, status="queued",
+                     requestId=uid(), digest=digest(payload.encode()), payload=snapshot)
+    row.change("submitting")
+    enqueue(db, user.org, "submit", submission.id)
+    audit(db, user.org, user.key, "提交外部工单", row.id, request.state.request_id)
+    return submission.view("payload")
+
+
+@router.get("/drafts/{draft_id}/submission")
+def get_submission(draft_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id)
+    return need(find(db, user.org, "submission", key=row.id)).view("payload")
+
+
+@router.post("/drafts/{draft_id}/complete")
+def complete(draft_id: str, body: Revision, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = own(db, user, "draft", draft_id, lock=True)
+    revision(row, body.revision)
+    device_for(db, user, row.data["device"]["id"])
+    if row.status != "linked":
+        fail(409, "LINK_REQUIRED", "请先关联外部工单")
+    if not row.data.get("completedAt"):
+        row.change(completedAt=now())
+        audit(db, user.org, user.key, "确认外部结单", row.id, request.state.request_id)
+    return view(db, user, row)
+

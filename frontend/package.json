@@ -1,0 +1,9 @@
+{
+  "name": "maintain-knowledge",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "dev": "vite --host 127.0.0.1", "build": "vue-tsc --noEmit && vite build" },
+  "dependencies": { "vue": "^3.5.0", "vue-router": "^4.5.0", "lucide-vue-next": "^0.468.0" },
+  "devDependencies": { "@vitejs/plugin-vue": "^5.2.0", "typescript": "~5.8.3", "vite": "^6.4.0", "vue-tsc": "^2.2.0", "@types/node": "^22.0.0" }
+}

@@ -1,0 +1,87 @@
+name: zhiwei
+x-service: &service
+  build: ./backend
+  volumes:
+    - ./private/clamav:/var/lib/clamav:ro
+  environment:
+    DATABASE_URL: postgresql+psycopg://maintenance_app:${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}@db:5432/maintenance
+    API_INIT: "false"
+    WORKER_INIT: "false"
+    DEMO_MODE: ${DEMO_MODE:-false}
+    SECURE_COOKIE: ${SECURE_COOKIE:-false}
+    ID_USERINFO_URL: ${ID_USERINFO_URL:-}
+    REGISTRY_URL: ${REGISTRY_URL:-}
+    INTEGRATION_TOKEN: ${INTEGRATION_TOKEN:-}
+    WORKORDER_URL: ${WORKORDER_URL:-}
+    WORKORDER_ENABLED: ${WORKORDER_ENABLED:-false}
+    ALLOW_MODEL_DATA: ${ALLOW_MODEL_DATA:-false}
+    MODEL_URL: ${MODEL_URL:-}
+    MODEL_KEY: ${MODEL_KEY:-}
+    CHAT_MODEL: ${CHAT_MODEL:-}
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-}
+    EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-0}
+    EMBEDDING_MIN_SIMILARITY: ${EMBEDDING_MIN_SIMILARITY:-0.48}
+    RRF_K: ${RRF_K:-60}
+    OCR_LANG: ${OCR_LANG:-chi_sim+eng}
+    CLAMAV_COMMAND: ${CLAMAV_COMMAND:-clamscan}
+    MAX_UPLOAD_MIB: ${MAX_UPLOAD_MIB:-20}
+    RETENTION_DAYS: ${RETENTION_DAYS:-90}
+    EXPERT_SLA_DAYS: ${EXPERT_SLA_DAYS:-2}
+    ORG_TIMEZONE: ${ORG_TIMEZONE:-Asia/Shanghai}
+    ORG_HOLIDAYS: ${ORG_HOLIDAYS:-}
+  depends_on:
+    init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.2-pg16
+    environment:
+      POSTGRES_DB: maintenance
+      POSTGRES_USER: maintenance_owner
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+      - ./backend/db-init.sh:/docker-entrypoint-initdb.d/01-app.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maintenance_owner -d maintenance"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+    restart: unless-stopped
+  init:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://maintenance_owner:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/maintenance
+      ADMIN_ORG: ${ADMIN_ORG:-pilot}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      DEMO_MODE: ${DEMO_MODE:-false}
+    command: ["python", "-c", "from maintenance.db import init_db; init_db()"]
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    <<: *service
+    command: ["uvicorn", "maintenance.main:app", "--host", "0.0.0.0", "--port", "8421"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8421/api/v1/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+  worker:
+    <<: *service
+    command: ["python", "-m", "maintenance.worker"]
+  web:
+    build: ./frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres:
+
