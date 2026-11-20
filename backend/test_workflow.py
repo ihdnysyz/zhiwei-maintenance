@@ -55,11 +55,15 @@ def upload(client, info, text):
 def test_import_review_ask_and_close_workorder(services, monkeypatch):
     client, worker = services
     info = dict(number="MAN-TEST", title="校验用检修手册", version="1.0",
-                model="IM-200", batch="A01", category="manual")
+                model="IM-200", batch="A01", category="manual", referenceUrl="https://example.invalid/catalog")
     original = "验收样本。K81 表示示例记录提示。核对面板状态和问题发生时间。"
     get(client, "/sources", 401)
     assert get(client, "/openapi.json")["openapi"] == "3.1.1"
     post(client, "/auth/demo", {"role": "library"})
+    invalid_url = client.post("/api/v1/sources/import",
+        data={"metadata": json.dumps([{**info, "referenceUrl": "javascript:alert(1)"}])},
+        files={"files": ("manual.txt", b"test", "text/plain")})
+    assert invalid_url.status_code == 422
     batch = upload(client, info, original)
     source_id = batch["items"][0]["sourceId"]
     duplicate = upload(client, info, original)["items"][0]
@@ -84,6 +88,8 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     get(client, f"/sources/{source_id}", 404)
     post(client, "/auth/demo", {"role": "tech"})
     first, second = get(client, "/devices")
+    listed = next(row for row in get(client, "/sources") if row["id"] == source_id)
+    assert listed["applicableDeviceId"] == first["id"]
     assert get(client, f"/sources/{source_id}?deviceId={first['id']}")["active"]
     get(client, f"/sources/{source_id}?deviceId={second['id']}", 404)
     session = post(client, "/sessions", dict(deviceId=first["id"]), 201)
@@ -95,6 +101,7 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     do_job(worker, "turn")
     turn = get(client, f"{url}/{turn['id']}")
     assert turn["decision"] == "evidence" and turn["citations"][0]["sourceId"] == source_id
+    assert turn["citations"][0]["referenceUrl"] == info["referenceUrl"]
     assert client.get(f"/api/v1/sources/{source_id}/file", params={
         "deviceId": first["id"], "chunkId": turn["citations"][0]["id"]}).text == original
     from maintenance import conversations
@@ -138,6 +145,7 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     post(client, draft_url + "/submit", {"revision": draft["revision"]}, 409)
     export = post(client, draft_url + "/export", {"revision": draft["revision"]})
     assert export["fields"]["result"] == fields["result"]
+    assert export["references"][0]["referenceUrl"] == info["referenceUrl"]
     draft = get(client, draft_url)
     draft = post(client, draft_url + "/register", {"revision": draft["revision"], "number": "CHECK-001"})
     draft = post(client, draft_url + "/complete", {"revision": draft["revision"]})
@@ -269,4 +277,168 @@ def test_deepseek_connection_probe_uses_fixed_prompt(services, monkeypatch):
     assert post(client, "/integrations/model/test") == {"status": "ok", "model": "deepseek-flash"}
     assert outbound[0]["messages"] == [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}]
     assert outbound[0]["thinking"] == {"type": "disabled"}
+
+
+def test_unknown_fault_code_does_not_return_unrelated_alarm(services):
+    client, worker = services
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    url = f"/sessions/{session['id']}/turns"
+    turn = post(client, url, {"clientMessageId": uuid4().hex, "text": "ZZ999 温度告警是什么意思？"}, 202)
+    do_job(worker, "turn")
+    answer = get(client, f"{url}/{turn['id']}")
+    assert answer["decision"] == "no_evidence" and answer["citations"] == []
+
+
+def test_device_model_in_question_is_not_copied_as_fault_code(services):
+    client, worker = services
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    url = f"/sessions/{session['id']}/turns"
+    post(client, url, {"clientMessageId": uuid4().hex, "text": "IM-200 型号有哪些温度告警资料？"}, 202)
+    do_job(worker, "turn")
+    draft = post(client, "/drafts", {"sessionId": session["id"]}, 201)
+    assert draft["fields"]["faultCode"] == ""
+
+
+def test_grounding_rejects_quote_that_omits_negation(services, monkeypatch):
+    from maintenance import conversations
+
+    evidence = [{"category": "manual", "text": "禁止跨型号使用保护参数。"}]
+    monkeypatch.setattr(conversations, "model_call", lambda *_: {
+        "choices": [{"message": {"content": json.dumps({"claims": [{"id": 1, "quote": "跨型号使用保护参数。"}]})}}]})
+    with pytest.raises(ValueError):
+        conversations.grounded_answer("可否跨型号使用保护参数？", evidence)
+
+
+def test_answer_shows_only_the_sources_it_cites(services, monkeypatch):
+    from maintenance import conversations
+
+    client, worker = services
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
+    text = "E07 温度告警是什么？"
+    candidates = get(client, f"/knowledge/search?deviceId={device['id']}&q={text}")
+    assert {row["number"] for row in candidates} == {"MAN-001", "WO-001"}
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
+    monkeypatch.setattr(conversations.cfg, "chat_model", "validation-chat")
+    monkeypatch.setattr(conversations, "model_call", lambda *_: {
+        "choices": [{"message": {"content": json.dumps({
+            "claims": [{"id": 1, "quote": "示例故障码 E07 表示温度告警。"}],
+        })}}]})
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    url = f"/sessions/{session['id']}/turns"
+    turn = post(client, url, {"text": text, "clientMessageId": uuid4().hex}, 202)
+    do_job(worker, "turn")
+    result = get(client, f"{url}/{turn['id']}")
+    assert result["decision"] == "answer" and "示例故障码 E07 表示温度告警。 [1]" in result["answer"]
+    assert [row["number"] for row in result["citations"]] == ["MAN-001"]
+
+
+def test_chat_retries_temporary_provider_failure(services, monkeypatch):
+    import httpx
+    from maintenance import knowledge
+
+    monkeypatch.setattr(knowledge.cfg, "model_url", "https://example.com")
+    monkeypatch.setattr(knowledge.cfg, "allow_model_data", True)
+    codes = iter([503, 200, 503, 503])
+
+    def send(url, **kwargs):
+        return httpx.Response(next(codes), request=httpx.Request("POST", url), json={"choices": []})
+
+    monkeypatch.setattr(knowledge.httpx, "post", send)
+    assert knowledge.model_call("chat/completions", {}) == {"choices": []}
+    with pytest.raises(httpx.HTTPStatusError):
+        knowledge.model_call("chat/completions", {})
+    assert next(codes, None) is None
+
+
+def test_chat_outage_keeps_the_scoped_references(services, monkeypatch):
+    import httpx
+    from maintenance import conversations
+
+    client, worker = services
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    url = f"/sessions/{session['id']}/turns"
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
+    monkeypatch.setattr(conversations.cfg, "chat_model", "local-test-model")
+
+    def unavailable(*args):
+        raise httpx.ReadTimeout("simulated provider outage")
+
+    monkeypatch.setattr(conversations, "model_call", unavailable)
+    turn = post(client, url, {"clientMessageId": uuid4().hex, "text": "E07 温度告警可能与什么有关？"}, 202)
+    do_job(worker, "turn")
+    result = get(client, f"{url}/{turn['id']}")
+    assert result["decision"] == "evidence" and result["modelDegraded"]
+    assert result["citations"] and all("E07" in row["text"] for row in result["citations"])
+
+
+def test_new_documents_can_be_approved_for_model_answers(services, monkeypatch):
+    from maintenance import conversations
+
+    client, worker = services
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
+    monkeypatch.setattr(conversations.cfg, "model_demo_only", True)
+    monkeypatch.setattr(conversations.cfg, "model_demo_source_ids", "")
+    monkeypatch.setattr(conversations.cfg, "model_url", "https://model.example.invalid")
+    monkeypatch.setattr(conversations.cfg, "chat_model", "validation-chat")
+    post(client, "/auth/demo", {"role": "platform"})
+    model = "QRM-610"
+    new_device = post(client, "/devices", {"number": model, "name": "验收用新设备", "model": model})
+
+    quote = "验收设备的观察窗口直径为 64 毫米。"
+    private = "验收设备的观察窗口仅作为内部检查使用。"
+    outbound = []
+
+    def fake_model(endpoint, payload):
+        context = json.loads(payload["messages"][-1]["content"])
+        outbound.append(context)
+        assert [item["text"] for item in context["evidence"]] == [quote]
+        return {"choices": [{"message": {"content": json.dumps({"claims": [{"id": 1, "quote": quote}]})}}]}
+
+    monkeypatch.setattr(conversations, "model_call", fake_model)
+
+    def ask(text):
+        post(client, "/auth/demo", {"role": "tech"})
+        session = post(client, "/sessions", {"deviceId": new_device["id"]}, 201)
+        url = f"/sessions/{session['id']}/turns"
+        turn = post(client, url, {"text": text, "clientMessageId": uuid4().hex}, 202)
+        do_job(worker, "turn")
+        return get(client, f"{url}/{turn['id']}")
+
+    def publish(number, body, allow, category):
+        post(client, "/auth/demo", {"role": "library"})
+        metadata = dict(number=number, version="1.0", title=number, model=model, category=category)
+        source_id = upload(client, metadata, body)["items"][0]["sourceId"]
+        do_job(worker, "parse")
+        path = f"/sources/{source_id}"
+        source = get(client, path)
+        post(client, path + "/actions", dict(revision=source["revision"], action="review",
+             verified=True, allowExternalModel=True), 422)
+        source = post(client, path + "/actions", dict(revision=source["revision"], action="review", verified=True))
+        post(client, path + "/actions", dict(revision=source["revision"], action="approve", allowExternalModel=allow), 403)
+        post(client, "/auth/demo", {"role": "expert"})
+        assert get(client, path)["modelApprovalHost"] == "model.example.invalid"
+        source = post(client, path + "/actions", dict(revision=source["revision"], action="approve", allowExternalModel=allow))
+        assert get(client, path)["externalModelApproved"] is allow
+        post(client, "/auth/demo", {"role": "library"})
+        post(client, path + "/actions", dict(revision=source["revision"], action="publish"))
+        return source_id
+
+    publish("PRIVATE-QRM", private, False, "case")
+    assert ask("验收设备的观察窗口有哪些历史案例？")["decision"] == "evidence"
+    assert outbound == []
+    approved_id = publish("MAN-QRM-610", quote, True, "manual")
+    result = ask("验收设备的观察窗口直径是多少？")
+    assert result["decision"] == "answer" and quote in result["answer"]
+    assert [row["sourceId"] for row in result["citations"]] == [approved_id]
+    assert len(outbound) == 1
+    monkeypatch.setattr(conversations.cfg, "model_url", "https://replacement.example.invalid")
+    assert ask("验收设备的观察窗口直径是多少？")["decision"] == "evidence"
+    assert len(outbound) == 1
 

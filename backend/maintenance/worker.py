@@ -109,7 +109,7 @@ def parse_source(job):
         raise ValueError("没有可校核的文字")
     vectors = [None] * len(document)
     degraded = False
-    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_demo_only:
+    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:
         from .conversations import redact
         try:
             for start in range(0, len(document), 16):

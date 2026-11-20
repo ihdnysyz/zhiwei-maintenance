@@ -8,12 +8,12 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from .common import actor, device_for, fail, get_db, need, permitted_device, revision, role
 from .db import Chunk, Record, Scope, add, audit, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
-from .knowledge import KINDS, applicability, authorized_citation, embeddings, retrieve
+from .knowledge import KINDS, applicability, authorized_citation, embeddings, model_approval_endpoint, retrieve
 
 router = APIRouter()
 CONTENT_TYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -28,6 +28,14 @@ class ImportInfo(BaseModel):
     model: str = Field(min_length=1, max_length=80)
     batch: str = Field(default="", max_length=80)
     category: Literal["manual", "workorder", "case"]
+    referenceUrl: AnyHttpUrl | None = None
+
+    @field_validator("referenceUrl")
+    @classmethod
+    def public_reference(cls, url):
+        if url is not None and (url.username or url.password):
+            raise ValueError("来源链接不得包含登录凭据")
+        return url
 
 
 class SourceAction(BaseModel):
@@ -35,6 +43,7 @@ class SourceAction(BaseModel):
     revision: int
     action: Literal["review", "approve", "reject", "publish", "block"]
     verified: bool = False
+    allowExternalModel: bool = False
     note: str = Field(default="", max_length=1500)
     start: str = ""
     end: str = ""
@@ -77,14 +86,18 @@ def list_sources(user=Depends(actor), db=Depends(get_db, scope="function")):
     sources = list(db.scalars(records(user.org, "source").order_by(Record.updated.desc())))
     if can_manage:
         active = {scope.source for scope in db.scalars(current_scopes(user.org).where(Scope.status == "bind"))}
-        return [{**row.view("digest"), "active": row.id in active} for row in sources if permitted_device(user, row.data)]
-    active = set()
-    devices = { (row.data["model"], row.data["batch"]) for row in db.scalars(records(user.org, "device"))
-                if permitted_device(user, row.data) }
-    for model, batch in devices:
+        return [{**row.view("digest", "approvedModelEndpoint"), "active": row.id in active}
+                for row in sources if permitted_device(user, row.data)]
+    active, devices = {}, {}
+    for row in db.scalars(records(user.org, "device").order_by(Record.key)):
+        if permitted_device(user, row.data):
+            devices.setdefault((row.data["model"], row.data["batch"]), row.id)
+    for (model, batch), device_id in devices.items():
         applicable, _ = applicability(db, user.org, {"model": model, "batch": batch})
-        active.update(applicable)
-    return [{**row.view("digest", "verifiedBy", "reviewer", "note", "approvedDigest"), "active": True}
+        for source_id in applicable:
+            active.setdefault(source_id, device_id)
+    return [{**row.view("digest", "verifiedBy", "reviewer", "note", "approvedDigest", "approvedModelEndpoint"),
+             "active": True, "applicableDeviceId": active[row.id]}
             for row in sources if row.id in active]
 
 
@@ -93,9 +106,10 @@ def import_sources(request: Request, files: Annotated[list[UploadFile], File()],
                    metadata: Annotated[str, Form()], user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library")
     try:
-        entries = [ImportInfo.model_validate(entry).model_dump() for entry in json.loads(metadata)]
+        entries = [ImportInfo.model_validate(entry).model_dump(mode="json", exclude_none=True)
+                   for entry in json.loads(metadata)]
     except (ValueError, TypeError):
-        fail(422, "INVALID_METADATA", "请检查来源编号、版本、类型和设备范围")
+        fail(422, "INVALID_METADATA", "请检查来源编号、版本、类型、设备范围和来源链接")
     if not 1 <= len(files) == len(entries) <= 30:
         fail(422, "INVALID_BATCH", "每批 1 至 30 个文件，每份文件需要一条资料信息")
     items = []
@@ -172,7 +186,7 @@ def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
         need(find(db, user.org, "family", key=number, lock=True))
         if not body.version or find(db, user.org, "source", key=f"{number}:{body.version}"):
             fail(409, "VERSION_EXISTS", "请输入尚未使用的新版本")
-        info = {key: row.data[key] for key in ImportInfo.model_fields}
+        info = {key: row.data[key] for key in ImportInfo.model_fields if key in row.data}
         info["version"] = body.version
         source, _ = queue_source(db, user.org, user.key, info, row.data["filename"], row.blob)
         row.change("resolved", replacementId=source.id)
@@ -197,7 +211,12 @@ def get_source(source_id: str, deviceId: str = "", user=Depends(actor), db=Depen
     history = [scope.view() for scope in db.scalars(scopes(user.org).where(
         Scope.number == row.data["number"]).order_by(Scope.start.desc()))] if manager else []
     active = db.scalar(current_scopes(user.org).where(Scope.source == row.id, Scope.status == "bind").limit(1)) is not None
-    fields = row.view("digest") if manager else row.view("digest", "reviewer", "verifiedBy", "note", "approvedDigest")
+    if manager:
+        host, endpoint_key = model_approval_endpoint()
+        fields = {**row.view("digest", "approvedModelEndpoint"), "modelApprovalHost": host,
+                  "externalModelApproved": bool(endpoint_key and endpoint_key == row.data.get("approvedModelEndpoint"))}
+    else:
+        fields = row.view("digest", "reviewer", "verifiedBy", "note", "approvedDigest", "approvedModelEndpoint")
     return {**fields, "active": active, "chunks": [chunk.view() for chunk in chunks], "scopes": history}
 
 
@@ -228,7 +247,7 @@ def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request
     target.embedding = None
     target.embedding_model = ""
     keyword_only = row.data.get("keywordOnly", False)
-    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_demo_only:
+    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:
         from .conversations import redact
         try:
             target.embedding = embeddings([redact(body.text[:1800])])[0]
@@ -261,6 +280,8 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
     data = source.data
     if not permitted_device(user, data):
         fail(403, "SCOPE_DENIED", "资料超出设备范围")
+    if body.allowExternalModel and body.action != "approve":
+        fail(422, "MODEL_APPROVAL_ACTION", "请在独立审核通过时授权回答模型")
     if body.action == "review" and source.status in {"calibration", "returned"}:
         if not body.verified:
             fail(422, "CALIBRATION_REQUIRED", "请先核对片段、故障码、关键数值和原图")
@@ -271,8 +292,11 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
         if body.action == "reject" and not body.note.strip():
             fail(422, "REVIEW_NOTE_REQUIRED", "请填写退回原因")
         approved = body.action == "approve"
+        endpoint_key = model_approval_endpoint()[1] if body.allowExternalModel else ""
+        if body.allowExternalModel and not endpoint_key:
+            fail(409, "MODEL_APPROVAL_DISABLED", "当前未启用按资料授权的回答模型")
         source.change("approved" if approved else "returned", reviewer=user.key, note=body.note,
-                      approvedDigest=data.get("digest") if approved else "")
+                      approvedDigest=data.get("digest") if approved else "", approvedModelEndpoint=endpoint_key)
     elif body.action in {"publish", "block"} and source.status in {"approved", "published", "withdrawn"}:
         if not data.get("indexReady") or data.get("approvedDigest") != data.get("digest"):
             fail(409, "INDEX_REQUIRED", "已审核摘要或索引尚未就绪")
@@ -302,7 +326,9 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
     else:
         fail(409, "SOURCE_STATE", "当前资料状态不支持此操作")
     audit(db, user.org, user.key, "资料·" + body.action, source.id, request.state.request_id)
-    return source.view("digest")
+    if body.allowExternalModel:
+        audit(db, user.org, user.key, "资料·授权回答模型", source.id, request.state.request_id)
+    return source.view("digest", "approvedModelEndpoint")
 
 
 def file_response(blob, filename, media, inline=False):

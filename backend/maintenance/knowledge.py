@@ -5,6 +5,7 @@ import subprocess
 from collections import Counter, defaultdict
 from math import isfinite
 from pathlib import Path
+from time import sleep
 from urllib.parse import urlsplit
 from zipfile import ZipFile
 
@@ -14,14 +15,46 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 from pypdf import PdfReader
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import select, type_coerce
+from sqlalchemy import func, select, type_coerce
 from sqlalchemy.orm import defer
 
-from .db import Chunk, Record, Scope, cfg, current_scopes, find, records, set_org
+from .db import Chunk, Record, Scope, cfg, current_scopes, digest, find, records, set_org
 
 KINDS = {"manual": "维修手册", "workorder": "历史工单", "case": "故障案例"}
 CODES = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{1,5}[-_]?\d{2,6}(?![A-Za-z0-9])")
 SAFETY = re.compile(r"停机|送电|断电|带电|拆卸|拆装|高压|旁路|短接|复位|急停|隔离电|安全联锁|重启|合闸")
+MODEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+
+
+def model_approval_endpoint():
+    if not (cfg.model_source_review and cfg.allow_model_data and cfg.model_url and cfg.chat_model):
+        return "", ""
+    endpoint = cfg.model_url.rstrip("/")
+    host = urlsplit(endpoint).hostname or ""
+    return (host, digest(endpoint.encode())) if host else ("", "")
+
+
+def model_evidence(db, org, candidates, primary):
+    if not (cfg.allow_model_data and cfg.chat_model):
+        return []
+    leading = next((item for item in candidates if item["category"] == primary), None)
+    if leading is None:
+        return []
+    if not cfg.model_source_review:
+        return candidates
+
+    _, endpoint_key = model_approval_endpoint()
+    allowed = {value.strip() for value in cfg.model_demo_source_ids.split(",") if value.strip()} if cfg.model_demo_only else set()
+    allowed.update(item["sourceId"] for item in candidates if item["demo"])
+    pending = {item["sourceId"] for item in candidates} - allowed
+    if endpoint_key and pending:
+        for source in db.scalars(records(org, "source").where(Record.id.in_(pending))):
+            if (source.data.get("approvedModelEndpoint") == endpoint_key and source.data.get("digest")
+                    and source.data.get("approvedDigest") == source.data["digest"]):
+                allowed.add(source.id)
+    if leading["sourceId"] not in allowed:
+        return []
+    return [item for item in candidates if item["sourceId"] in allowed]
 
 
 def parse_file(filename, raw, category="manual"):
@@ -148,10 +181,20 @@ def model_call(endpoint, payload, *, connection_test=False):
         if endpoint == "chat/completions":
             payload = {**payload, "thinking": {"type": "disabled"}}
     headers = {"Authorization": f"Bearer {cfg.model_key}"} if cfg.model_key else {}
-    response = httpx.post(f"{cfg.model_url.rstrip('/')}/{endpoint}", headers=headers,
-                          json=payload, timeout=12, follow_redirects=False)
-    response.raise_for_status()
-    return response.json()
+    url = f"{cfg.model_url.rstrip('/')}/{endpoint}"
+    attempts = 2 if endpoint == "chat/completions" and not connection_test else 1
+    for attempt in range(attempts):
+        try:
+            response = httpx.post(url, headers=headers, json=payload, timeout=12, follow_redirects=False)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if attempt + 1 == attempts or exc.response.status_code not in {408, 502, 503, 504}:
+                raise
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError):
+            if attempt + 1 == attempts:
+                raise
+        sleep(0.25)
 
 
 def embeddings(texts):
@@ -205,24 +248,46 @@ def codes_in(value):
     return {m.upper() for m in CODES.findall(value)}
 
 
+def code_key(code):
+    return code.replace("-", "").replace("_", "")
+
+
+def fault_codes(value, device):
+    identifiers = codes_in(f"{device.get('number', '')} {device.get('model', '')}")
+    device_keys = {code_key(code) for code in identifiers}
+    return {code for code in codes_in(value) if code_key(code) not in device_keys}
+
+
 def retrieve(db, org, device, query, limit=6):
     set_org(db, org)
+    mentioned = {token.lower().rstrip(".") for token in MODEL_TOKEN.findall(query)
+                 if any(char.isdigit() for char in token)}
+    mentioned.discard(device["model"].lower())
+    if mentioned and db.scalar(records(org, "device").where(
+            func.lower(Record.data["model"].as_string()).in_(mentioned)).limit(1)):
+        return [], False
     ids, ambiguous = applicability(db, org, device)
     if ambiguous or not ids:
         return [], ambiguous
     sources = {r.id: r for r in db.scalars(records(org, "source").where(Record.id.in_(ids)))}
     tokens = terms(query)
-    faults = codes_in(query) - codes_in(device.get("number", ""))
+    faults = {code_key(code) for code in fault_codes(query, device)}
+    matched_faults = set()
     groups = defaultdict(list)
     base = select(Chunk).where(Chunk.org == org, Chunk.source.in_(ids))
     for chunk in db.scalars(base.options(defer(Chunk.embedding))):
         source = sources[chunk.source]
-        full = f"{source.data['title']} {chunk.body}"
-        exact = int(bool(faults.intersection(codes_in(full))))
+        full = f"{source.data['title']} {chunk.position} {chunk.body}"
+        exact = faults.intersection(code_key(code) for code in codes_in(full))
+        if faults and not exact:
+            continue
+        matched_faults.update(exact)
         lexical = sum((tokens & terms(full)).values())
-        groups[ids[source.id], source.data["category"] == "manual"].append((chunk, exact, lexical))
+        groups[ids[source.id], source.data["category"] == "manual"].append((chunk, len(exact), lexical))
+    if faults - matched_faults:
+        return [], False
     semantic = {}
-    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_demo_only:
+    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:
         try:
             from .conversations import redact
             vector = embeddings([redact(query)])[0]
@@ -286,7 +351,8 @@ def semantic_matches(db, vector, ids, org):
 def citation(source, chunk):
     return {**chunk.view(), "sourceId": source.id, "title": source.data["title"],
             "number": source.data["number"], "version": source.data["version"],
-            "category": source.data["category"], "demo": source.data.get("demo", False)}
+            "category": source.data["category"], "demo": source.data.get("demo", False),
+            "referenceUrl": source.data.get("referenceUrl")}
 
 
 def authorized_citation(db, org, chunk_id, device):

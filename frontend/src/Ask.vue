@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, BookOpen, ChevronDown, ChevronRight, CircleAlert, ClipboardPlus, Cpu, History, LoaderCircle, Plus, Search, Sparkles, Users, X } from 'lucide-vue-next'
+import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, BookOpen, ChevronDown, ChevronRight, CircleAlert, ClipboardPlus, Cpu, History, LoaderCircle, Plus, Search, Sparkles, Users, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
 import { api, categories, errorMessage, notice, store, type Row } from './store'
 
@@ -26,25 +26,31 @@ let active = true
 let change = 0
 let retryKey: { sessionId: string; text: string; id: string } | undefined
 const pending = computed(() => session.value?.turns?.some((row: Row) => row.status === 'queued'))
+const currentDevice = computed(() => store.devices.find(row => row.id === deviceId.value))
 const defaultPrompts = computed(() => [
-  store.profile?.demo ? 'E07 温度告警如何核对？' : '如何核对设备的故障码？',
+  currentDevice.value?.demo ? 'E07 温度告警如何核对？' : '如何核对设备的故障码？',
   '设备出现振动与异响，有类似案例吗？',
   '有哪些适用于这台设备的维修手册？',
 ])
-const currentDevice = computed(() => store.devices.find(row => row.id === deviceId.value))
 const matchedDevices = computed(() => store.devices.filter(row =>
   [row.name, row.model, row.number, row.batch].join(' ').toLowerCase().includes(deviceSearch.value.toLowerCase())))
 const safeScroll = () => nextTick(() => bottom.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))
 async function history() { sessions.value = await api<Row[]>('/sessions') }
 onMounted(() => history().catch(error => notice(errorMessage(error), true)))
 onUnmounted(() => { active = false; clearTimeout(timer) })
-watch(() => [route.params.id, route.query.q], async ([id, query]) => {
+watch(() => [route.params.id, route.query.q, route.query.device], async ([id, query, requestedDevice]) => {
   const generation = ++change
   clearTimeout(timer)
   evidence.value = null
   escalateTurn.value = null
   if (query) question.value = String(query)
-  if (!id) { session.value = null; return }
+  if (!id) {
+    session.value = null
+    loading.value = false
+    const selected = store.devices.find(row => row.id === requestedDevice)
+    if (selected) deviceId.value = selected.id
+    return
+  }
   loading.value = true
   try {
     const row = await api<Row>('/sessions/' + id)
@@ -82,6 +88,9 @@ async function selectDevice(row: Row) {
   if (session.value) {
     await router.push('/ask')
     notice('已切换设备，新的提问将创建诊断会话')
+  } else if (route.query.device) {
+    if (question.value === route.query.q) question.value = ''
+    await router.replace('/ask')
   }
 }
 async function send() {
@@ -121,7 +130,7 @@ async function newSession() {
   question.value = ''
   showHistory.value = false
   if (route.path !== '/ask') await router.push('/ask')
-  else if (route.query.q) await router.replace('/ask')
+  else if (route.query.q || route.query.device) await router.replace('/ask')
   composer.value?.focus()
 }
 async function createDraft() {
@@ -164,7 +173,7 @@ async function escalate() {
               <p v-if="!matchedDevices.length" class="muted">没有匹配的设备。请联系管理员维护台账。</p>
             </div>
           </div>
-          <span v-if="currentDevice" class="chat-model">{{ currentDevice.model }}</span>
+          <span v-if="currentDevice" class="chat-model">{{ currentDevice.model }}{{ currentDevice.demo ? ' · 演示设备' : '' }}</span>
           <button class="icon-btn mobile-history" aria-label="新建诊断" @click="newSession"><Plus :size="20"/></button>
         </div>
         <div class="chat-messages">
@@ -172,7 +181,7 @@ async function escalate() {
           <div v-else-if="!session?.turns?.length" class="chat-welcome">
             <div class="welcome-mark"><Sparkles :size="29"/></div><h2>今天要排查什么问题？</h2>
             <p>输入故障码或描述现场现象，问答会附上可核查的依据。</p>
-            <div class="suggestions"><button v-for="prompt in defaultPrompts" :key="prompt" @click="fill(prompt)">{{ prompt }}<ArrowRight :size="16"/></button></div>
+            <div class="suggestions"><button v-for="(prompt, index) in defaultPrompts" :key="prompt" @click="fill(prompt)">{{ currentDevice?.demo && index === 0 ? '演示样例 · ' : '' }}{{ prompt }}<ArrowRight :size="16"/></button></div>
           </div>
           <div v-else v-for="turn in session.turns" :key="turn.id" class="turn">
             <div class="user-message">{{ turn.text }}</div>
@@ -182,8 +191,8 @@ async function escalate() {
               <template v-else>
                 <p class="answer-body">{{ turn.answer }}</p>
                 <div v-if="turn.citations?.length" class="citations">
-                  <h3><BookOpen :size="16"/> 资料出处</h3>
-                  <button v-for="(item, index) in turn.citations" :key="item.id" @click="evidence = item"><span class="ref-index">{{ index + 1 }}</span><span><b>{{ item.title }}</b><small>{{ categories[item.category] }} · {{ item.position }} · V{{ item.version }}</small></span><ChevronRight :size="17"/></button>
+                  <h3><BookOpen :size="16"/> {{ turn.decision === 'evidence' ? '相关资料' : '资料出处' }}</h3>
+                  <button v-for="(item, index) in turn.citations" :key="item.id" @click="evidence = item"><span class="ref-index">{{ index + 1 }}</span><span><b>{{ item.title }}</b><small>{{ item.demo ? '演示样例 · ' : '' }}{{ categories[item.category] }} · {{ item.position }} · V{{ item.version }}</small></span><ChevronRight :size="17"/></button>
                 </div>
                 <div class="tag-row"><button class="text-link escalate" @click="feedback = false; escalateTurn = turn"><Users :size="16"/> 转交专家</button><button class="text-link escalate" @click="feedback = true; escalateTurn = turn">反馈答复</button></div>
               </template>
@@ -199,9 +208,12 @@ async function escalate() {
       </section>
     </div>
     <dialog v-if="evidence" open class="sheet" aria-label="资料出处" @keydown.esc="evidence = null">
-      <div class="sheet-head"><div><p class="eyebrow">{{ categories[evidence.category] }} · V{{ evidence.version }}</p><h2>{{ evidence.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="evidence = null"><X :size="22"/></button></div>
+      <div class="sheet-head"><div><p class="eyebrow">{{ evidence.demo ? '演示样例 · ' : '' }}{{ categories[evidence.category] }} · V{{ evidence.version }}</p><h2>{{ evidence.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="evidence = null"><X :size="22"/></button></div>
       <div class="sheet-body"><p class="muted">{{ evidence.number }} · {{ evidence.position }}</p><div class="document-text">{{ evidence.text }}</div>
-        <a v-if="!evidence.demo" class="btn secondary" :href="originalLink(evidence)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> 打开原件</a>
+        <div class="tag-row">
+          <a v-if="evidence.referenceUrl" class="btn secondary" :href="evidence.referenceUrl" target="_blank" rel="noopener noreferrer"><ArrowUpRight :size="17"/> 查看发布来源</a>
+          <a v-if="!evidence.demo" class="btn secondary" :href="originalLink(evidence)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> 查看入库文件</a>
+        </div>
       </div>
     </dialog>
     <div v-if="evidence || escalateTurn" class="backdrop" @click="evidence = null; escalateTurn = null"></div>

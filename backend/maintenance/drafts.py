@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .common import actor, device_for, fail, get_db, need, own, revision
 from .conversations import session_turns, turn_view
 from .db import Record, add, audit, cfg, digest, enqueue, find, now, records, uid
-from .knowledge import codes_in
+from .knowledge import fault_codes
 from .library import file_response
 
 router = APIRouter()
@@ -87,7 +87,7 @@ def create(body: DraftCreate, request: Request, user=Depends(actor), db=Depends(
         return view(db, user, existing)
     last = turns[-1]
     symptom = "\n".join(row.data["text"] for row in turns)[-8000:]
-    codes = codes_in(last.data["text"]) - codes_in(device["number"])
+    codes = fault_codes(last.data["text"], device)
     fault = next(iter(codes)) if len(codes) == 1 else ""
     fields = {"symptom": symptom, "faultCode": fault, "cause": "", "actions": "", "result": ""}
     row = add(db, user.org, "draft", key=session.id, owner=user.key, status="draft", sessionId=session.id,
@@ -192,7 +192,8 @@ def confirm(draft_id: str, body: Revision, request: Request, user=Depends(actor)
     snapshot = dict(draftId=row.id, confirmedAt=now(), confirmedBy=user.key, version=row.rev + 1,
                     device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
                     fields=row.data["fields"], fieldOrigins=row.data["origins"],
-                    references=[{key: ref[key] for key in ("sourceId", "number", "version", "position", "id")} for ref in references],
+                    references=[{key: ref[key] for key in ("sourceId", "number", "version", "position", "id", "referenceUrl")
+                                 if ref.get(key) is not None} for ref in references],
                     attachments=[item.view() for item in attachments(db, user.org, row.id)])
     row.change("confirmed", snapshot=snapshot)
     audit(db, user.org, user.key, "确认工单快照", row.id, request.state.request_id)

@@ -227,14 +227,14 @@ textarea { resize: vertical; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .backdrop { position: fixed; inset: 0; z-index: 39; background: #0d261c65; backdrop-filter: blur(2px); }
 dialog.sheet, dialog.modal { position: fixed; border: 1px solid var(--line); padding: 0; z-index: 40; background: white; color: #21382d; box-shadow: 0 16px 70px #0e2b2640; max-width: calc(100vw - 20px); overflow: hidden; }
-dialog.sheet { inset: 10px 10px 10px auto; margin: 0; width: 535px; max-height: none; border-radius: 17px; display: flex; flex-direction: column; animation: slide .2s ease-out; }
+dialog.sheet { inset: 10px 10px 10px auto; margin: 0; width: 535px; max-height: calc(100dvh - 20px); border-radius: 17px; display: flex; flex-direction: column; animation: slide .2s ease-out; }
 dialog.modal { inset: 50% auto auto 50%; margin: 0; transform: translate(-50%,-50%); max-height: min(87dvh,800px); width: 550px; border-radius: 17px; display: flex; flex-direction: column; }
 dialog.wide { width: 740px; }
 @keyframes slide { from { transform: translateX(24px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-.sheet-head { padding: 17px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.sheet-head { flex-shrink: 0; padding: 17px 20px; border-bottom: 1px solid var(--line); display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
 .sheet-head h2 { overflow-wrap: anywhere; }
 .sheet-head p { font-size: 13px; }
-.sheet-body { padding: 19px 20px; overflow: auto; }
+.sheet-body { min-height: 0; padding: 19px 20px; overflow: auto; }
 .sheet-body p { overflow-wrap: anywhere; }
 .document-text { white-space: pre-wrap; overflow-wrap: anywhere; background: #f6f9f7; border: 1px solid #e3eee7; padding: 13px; border-radius: 9px; line-height: 1.68; font-size: 14px; margin: 7px 0 12px; }
 .doc-section { border-bottom: 1px solid var(--line); padding: 4px 0 9px; }

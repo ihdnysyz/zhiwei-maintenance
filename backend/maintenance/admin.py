@@ -212,7 +212,7 @@ def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
                            error=job.error) for job in jobs], audit=[row.view() for row in history],
                 submissions=[row.view("payload") for row in submissions],
                 integrations=dict(model=bool(cfg.model_url and cfg.model_key and cfg.allow_model_data and cfg.chat_model),
-                                  embedding=bool(cfg.embedding_model and cfg.allow_model_data and not cfg.model_demo_only),
+                                  embedding=bool(cfg.embedding_model and cfg.allow_model_data and not cfg.model_source_review),
                                   identity=bool(cfg.id_userinfo_url),
                                   registry=bool(cfg.registry_url), workorder=bool(cfg.workorder_url and cfg.workorder_enabled)))
 

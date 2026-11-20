@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { ArrowDownToLine, BookOpen, ClipboardList, CloudUpload, FileSearch, FileText, History, Plus, RefreshCw, Search, Wrench, X } from 'lucide-vue-next'
+import { ArrowDownToLine, ArrowUpRight, BookOpen, ClipboardList, CloudUpload, FileSearch, FileText, History, Plus, RefreshCw, Search, Wrench, X } from 'lucide-vue-next'
 import { api, categories, date, errorMessage, notice, statuses, store, type Row } from './store'
 
-interface UploadItem { file: File; title: string; number: string; version: string; model: string; batch: string; category: string }
+interface UploadItem { file: File; title: string; number: string; version: string; model: string; batch: string; category: string; referenceUrl: string }
 const sources = ref<Row[]>([])
 const batches = ref<Row[]>([])
 const detail = ref<Row | null>(null)
@@ -20,6 +20,7 @@ const ready = ref(false)
 const openUpload = ref(false)
 const showBatches = ref(false)
 const verified = ref(false)
+const allowExternalModel = ref(false)
 const actionNote = ref('')
 const startAt = ref('')
 const endAt = ref('')
@@ -53,10 +54,15 @@ async function search() {
 }
 async function view(row: Row) {
   verified.value = false
+  allowExternalModel.value = false
   correctionId.value = ''
   actionNote.value = ''
   startAt.value = ''; endAt.value = ''; schedule.value = false; blockBatch.value = ''; errorText.value = ''
-  try { detail.value = await api<Row>('/sources/' + row.id + '?deviceId=' + deviceId.value) }
+  const viewDeviceId = row.applicableDeviceId || deviceId.value
+  try {
+    const source = await api<Row>('/sources/' + row.id + '?' + new URLSearchParams({ deviceId: viewDeviceId }))
+    detail.value = { ...source, viewDeviceId }
+  }
   catch (error) { notice(errorMessage(error), true) }
 }
 async function saveCorrection(id: string) {
@@ -76,7 +82,7 @@ function attach(ev: Event) {
   const input = ev.target as HTMLInputElement
   for (const file of Array.from(input.files || []).slice(0, 30 - upload.value.length)) {
     const title = file.name.replace(/\.[^.]+$/, '')
-    upload.value.push({ file, title, number: title.replace(/[:\s]/g, '-').slice(0, 90), version: '1.0', model: models.value[0] || '', batch: '', category: 'manual' })
+    upload.value.push({ file, title, number: title.replace(/[:\s]/g, '-').slice(0, 90), version: '1.0', model: models.value[0] || '', batch: '', category: 'manual', referenceUrl: '' })
   }
   input.value = ''
 }
@@ -87,7 +93,8 @@ async function importFiles() {
   try {
     const form = new FormData()
     for (const entry of upload.value) form.append('files', entry.file)
-    form.append('metadata', JSON.stringify(upload.value.map(({ file, ...info }) => info)))
+    form.append('metadata', JSON.stringify(upload.value.map(({ file, referenceUrl, ...info }) =>
+      ({ ...info, referenceUrl: referenceUrl.trim() || undefined }))))
     await api('/sources/import', 'POST', form)
     upload.value = []
     openUpload.value = false
@@ -124,6 +131,7 @@ async function action(name: string) {
       revision: detail.value.revision, action: name, verified: verified.value, note: actionNote.value,
       start: convert(startAt.value), end: convert(endAt.value),
       ...(name === 'block' && blockBatch.value.trim() ? { batch: blockBatch.value.trim() } : {}),
+      ...(name === 'approve' && allowExternalModel.value ? { allowExternalModel: true } : {}),
     })
     await fetchData()
     await view(row)
@@ -193,6 +201,7 @@ function closeDetail() { detail.value = null; errorText.value = '' }
             <label>资料类别<select v-model="item.category"><option v-for="(label,key) in categories" :key="key" :value="key">{{ label }}</option></select></label>
             <label>设备型号<input v-model="item.model" list="library-models" required maxlength="80" placeholder="通用资料填 *"/></label>
             <label>设备批次<input v-model="item.batch" maxlength="80" placeholder="留空适用该型号全部批次"/></label>
+            <label>来源网址<input v-model="item.referenceUrl" type="url" placeholder="https://"/></label>
           </div>
         </div>
         <datalist id="library-models"><option v-for="model in models" :key="model" :value="model"/></datalist>
@@ -206,7 +215,12 @@ function closeDetail() { detail.value = null; errorText.value = '' }
         <div class="tag-row"><span class="pill">{{ detail.model }} {{ detail.batch }}</span><span class="pill">{{ detail.demo ? '演示资料' : statuses[detail.status] }}</span><span v-if="detail.ocr" class="pill">包含 OCR</span></div>
         <p v-if="detail.error" class="error">{{ detail.error }}</p>
         <p v-if="detail.note" class="muted">最近审核意见 · {{ detail.note }}</p>
-        <a v-if="detail.filename && (manager || expert || detail.chunks?.length)" class="btn secondary own-width" :href="'/api/v1/sources/' + detail.id + '/file' + (manager || expert ? '' : '?deviceId=' + deviceId + '&chunkId=' + detail.chunks[0].id)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> {{ filename(detail) }}</a>
+        <p v-if="detail.externalModelApproved" class="muted">已授权回答模型 · {{ detail.modelApprovalHost }}</p>
+        <div v-if="detail.referenceUrl || (!manager && !expert && detail.active && detail.viewDeviceId)" class="tag-row">
+          <a v-if="detail.referenceUrl" class="text-link" :href="detail.referenceUrl" target="_blank" rel="noopener noreferrer"><ArrowUpRight :size="17"/> 查看发布来源</a>
+          <RouterLink v-if="!manager && !expert && detail.active && detail.viewDeviceId" class="text-link" :to="{ path: '/ask', query: { device: detail.viewDeviceId } }">按此设备提问</RouterLink>
+        </div>
+        <a v-if="detail.filename && (manager || expert || detail.chunks?.length)" class="btn secondary own-width" :href="'/api/v1/sources/' + detail.id + '/file' + (manager || expert ? '' : '?deviceId=' + detail.viewDeviceId + '&chunkId=' + detail.chunks[0].id)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> {{ filename(detail) }}</a>
         <details v-if="detail.scopes?.length && (manager || expert)" class="doc-section"><summary>版本生效记录</summary><p v-for="scope in detail.scopes" :key="scope.id">{{ scope.model }} {{ scope.batch }} · {{ scope.status === 'bind' ? '绑定' : '阻断' }} · {{ date(scope.start, true) }} 至 {{ scope.end ? date(scope.end, true) : '持续有效' }}</p></details>
         <article v-for="chunk in detail.chunks" :key="chunk.id" class="doc-section">
           <div class="section-head"><h3>{{ chunk.position }} {{ chunk.ocr ? '· OCR' : '' }}</h3><button v-if="manager && ['calibration','returned'].includes(detail.status) && correctionId !== chunk.id" class="text-link" @click="correctionId = chunk.id; correctedText = chunk.text">校正片段</button></div>
@@ -223,6 +237,10 @@ function closeDetail() { detail.value = null; errorText.value = '' }
         </template>
         <template v-if="expert && detail.status === 'review'">
           <label>审核意见<textarea v-model="actionNote" rows="3" maxlength="1500"></textarea></label>
+          <label v-if="detail.modelApprovalHost" class="check">
+            <input v-model="allowExternalModel" type="checkbox"/>
+            允许将本版本的相关摘录和提问发送给回答模型（{{ detail.modelApprovalHost }}）
+          </label>
           <div class="button-row"><button class="btn secondary" :disabled="!actionNote.trim() || working" @click="action('reject')">退回校核</button><button class="btn primary" :disabled="working" @click="action('approve')">审核通过</button></div>
         </template>
         <template v-if="manager && ['approved','published','withdrawn'].includes(detail.status)">

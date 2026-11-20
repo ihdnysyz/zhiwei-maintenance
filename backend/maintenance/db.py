@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     allow_model_data: bool = False
     model_demo_only: bool = False
     model_demo_source_ids: str = ""
+    model_require_source_approval: bool = False
     id_userinfo_url: str = ""
     registry_url: str = ""
     integration_token: str = ""
@@ -42,6 +43,10 @@ class Settings(BaseSettings):
     expert_sla_days: int = 2
     org_timezone: str = "Asia/Shanghai"
     org_holidays: str = ""
+
+    @property
+    def model_source_review(self):
+        return self.model_demo_only or self.model_require_source_approval
 
 
 cfg = Settings()

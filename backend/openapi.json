@@ -2279,6 +2279,11 @@
             "title": "Verified",
             "default": false
           },
+          "allowExternalModel": {
+            "type": "boolean",
+            "title": "Allowexternalmodel",
+            "default": false
+          },
           "note": {
             "type": "string",
             "maxLength": 1500,
