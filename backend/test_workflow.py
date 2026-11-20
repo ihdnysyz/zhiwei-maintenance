@@ -106,6 +106,23 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     do_job(worker, "turn")
     result = get(client, f"{url}/{next_turn['id']}")
     assert result["decision"] == "answer" and "K81 表示示例记录提示。" in result["answer"]
+    with monkeypatch.context() as protected:
+        protected.setattr(conversations.cfg, "model_demo_only", True)
+        protected.setattr(conversations.cfg, "model_demo_source_ids", "")
+        mock_model = conversations.model_call
+
+        def unexpected_egress(*args, **kwargs):
+            pytest.fail("Imported documents must stay local in the model demo")
+
+        protected.setattr(conversations, "model_call", unexpected_egress)
+        protected_turn = post(client, url, {"text": "K81 样例用途？", "clientMessageId": uuid4().hex}, 202)
+        do_job(worker, "turn")
+        assert get(client, f"{url}/{protected_turn['id']}")["decision"] == "evidence"
+        protected.setattr(conversations.cfg, "model_demo_source_ids", source_id)
+        protected.setattr(conversations, "model_call", mock_model)
+        allowed_turn = post(client, url, {"text": "K81 记录提示是什么？", "clientMessageId": uuid4().hex}, 202)
+        do_job(worker, "turn")
+        assert get(client, f"{url}/{allowed_turn['id']}")["decision"] == "answer"
     task = post(client, f"{url}/{turn['id']}/escalate", dict(note="请复核演示告警"), 201)
     assert task["assignee"] == "expert"
     draft = post(client, "/drafts", {"sessionId": session["id"]}, 201)
@@ -223,4 +240,33 @@ def test_semantic_retrieval_and_rls(services, monkeypatch):
     device = get(client, "/devices")[0]
     ranked = get(client, f"/knowledge/search?deviceId={device['id']}&q=checkVector")
     assert ranked[0]["sourceId"] == expected
+
+
+def test_deepseek_connection_probe_uses_fixed_prompt(services, monkeypatch):
+    import httpx
+    from maintenance import knowledge
+
+    client, _ = services
+    post(client, "/auth/demo", {"role": "tech"})
+    post(client, "/integrations/model/test", code=403)
+    post(client, "/auth/demo", {"role": "platform"})
+    monkeypatch.setattr(knowledge.cfg, "model_url", "https://api.deepseek.com")
+    monkeypatch.setattr(knowledge.cfg, "chat_model", "deepseek-flash")
+    monkeypatch.setattr(knowledge.cfg, "model_key", "")
+    post(client, "/integrations/model/test", code=409)
+    monkeypatch.setattr(knowledge.cfg, "model_key", "local-test-key")
+    monkeypatch.setattr(knowledge.cfg, "allow_model_data", False)
+    outbound = []
+
+    def send(url, *, headers, json, **options):
+        outbound.append(json)
+        assert url == "https://api.deepseek.com/chat/completions"
+        assert headers["Authorization"] == "Bearer local-test-key"
+        return httpx.Response(200, request=httpx.Request("POST", url),
+                              json={"choices": [{"message": {"content": '{"ok":true}'}}]})
+
+    monkeypatch.setattr(knowledge.httpx, "post", send)
+    assert post(client, "/integrations/model/test") == {"status": "ok", "model": "deepseek-flash"}
+    assert outbound[0]["messages"] == [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}]
+    assert outbound[0]["thinking"] == {"type": "disabled"}
 

@@ -5,6 +5,7 @@ import subprocess
 from collections import Counter, defaultdict
 from math import isfinite
 from pathlib import Path
+from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 import httpx
@@ -138,9 +139,14 @@ def split_blocks(blocks):
             yield position[:180], buffer, ocr
 
 
-def model_call(endpoint, payload):
-    if not (cfg.allow_model_data and cfg.model_url):
+def model_call(endpoint, payload, *, connection_test=False):
+    if not cfg.model_url or not (cfg.allow_model_data or connection_test):
         raise RuntimeError("模型数据传输未启用")
+    if urlsplit(cfg.model_url).hostname == "api.deepseek.com":
+        if not cfg.model_key:
+            raise RuntimeError("DeepSeek API Key 未配置")
+        if endpoint == "chat/completions":
+            payload = {**payload, "thinking": {"type": "disabled"}}
     headers = {"Authorization": f"Bearer {cfg.model_key}"} if cfg.model_key else {}
     response = httpx.post(f"{cfg.model_url.rstrip('/')}/{endpoint}", headers=headers,
                           json=payload, timeout=12, follow_redirects=False)
@@ -216,7 +222,7 @@ def retrieve(db, org, device, query, limit=6):
         lexical = sum((tokens & terms(full)).values())
         groups[ids[source.id], source.data["category"] == "manual"].append((chunk, exact, lexical))
     semantic = {}
-    if cfg.allow_model_data and cfg.embedding_model:
+    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_demo_only:
         try:
             from .conversations import redact
             vector = embeddings([redact(query)])[0]

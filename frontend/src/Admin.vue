@@ -48,6 +48,10 @@ function syncDevices() { return operation(async () => {
   const result = await api<{ count: number }>('/devices/sync', 'POST')
   notice('已同步 ' + result.count + ' 条设备记录')
 }) }
+function testModelConnection() { return operation(async () => {
+  const result = await api<{ status: string; model: string }>('/integrations/model/test', 'POST')
+  notice('模型连接成功 · ' + result.model)
+}) }
 function reconcile(row: Row, action: string) { return operation(async () => {
   await api('/submissions/' + row.id + '/actions', 'POST', { revision: row.revision, action })
   notice('已受理原请求核对')
@@ -73,6 +77,7 @@ function reconcile(row: Row, action: string) { return operation(async () => {
       <div v-if="tab === 'operations'" class="content-card form-stack">
         <div class="section-head"><div><h2>依赖与集成</h2></div><Activity :size="20" class="muted"/></div>
         <div class="tag-row"><span v-for="(enabled, key) in data?.integrations || {}" :key="key" :class="['pill', { green: enabled }]">{{ captions[String(key)] }} · {{ enabled ? '已配置' : '未启用' }}</span></div>
+        <div class="tag-row"><button class="btn secondary" :disabled="working" @click="testModelConnection">测试模型连接</button><span class="muted">使用固定测试内容检查接口</span></div>
         <p v-for="alert in data?.alerts || []" :key="alert.kind" class="page-error" role="alert">{{ alert.message }} · {{ alert.kind }}</p>
         <h3>外部回写结果</h3><p v-if="!data?.submissions?.length" class="muted">暂无回写记录。</p>
         <div v-for="row in data?.submissions || []" :key="row.id" class="batch-row"><span>{{ row.requestId }}</span><span class="pill">{{ statuses[row.status] || row.status }}</span><button v-if="['manual_review','not_created'].includes(row.status)" class="btn secondary" @click="reconcile(row, 'check')">查原请求</button><button v-if="row.status === 'not_created' && row.sameKeyRetry" class="btn secondary" @click="reconcile(row, 'retry')">同键重试</button></div>

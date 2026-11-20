@@ -1,4 +1,4 @@
-param([switch]$Demo, [int]$Port = 5173, [int]$ApiPort = 8421)
+param([switch]$Demo, [switch]$EnableModel, [int]$Port = 5173, [int]$ApiPort = 8421)
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
@@ -18,7 +18,8 @@ $env:SECURE_COOKIE = 'false'
 $env:DEMO_MODE = $Demo.IsPresent.ToString().ToLowerInvariant()
 if ($Demo) {
     $env:DATABASE_URL = 'sqlite:///./.local/maintenance.db'
-    $env:ALLOW_MODEL_DATA = 'false'
+    $env:ALLOW_MODEL_DATA = $EnableModel.IsPresent.ToString().ToLowerInvariant()
+    $env:MODEL_DEMO_ONLY = 'true'
     $env:WORKORDER_ENABLED = 'false'
 } elseif (-not $env:DATABASE_URL) {
     $env:DATABASE_URL = 'sqlite:///./.local/pilot.db'

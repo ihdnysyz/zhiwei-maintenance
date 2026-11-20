@@ -205,13 +205,17 @@ def answer_turn(db, org, turn):
                 data["answer"] = "缺少适用的已审核手册。请将问题转交班组专家核实。"
         else:
             condition = f"适用设备：{device['model']}" + (f" · 批次 {device['batch']}" if device.get("batch") else "")
+            demo_sources = set(cfg.model_demo_source_ids.split(","))
+            model_ready = bool(cfg.allow_model_data and cfg.chat_model and manual
+                               and (not cfg.model_demo_only or all(
+                                   item["demo"] or item["sourceId"] in demo_sources for item in candidates)))
             try:
-                if not cfg.chat_model or not manual:
-                    raise ValueError("no chat model or manual")
+                if not model_ready:
+                    raise ValueError("generation unavailable for this evidence")
                 answer = grounded_answer(query, candidates)
                 data.update(decision="answer", answer=answer + "\n\n" + condition)
             except (ValueError, RuntimeError, TypeError, KeyError, IndexError, httpx.HTTPError):
-                data.update(decision="evidence", modelDegraded=bool(cfg.allow_model_data and cfg.chat_model and manual),
+                data.update(decision="evidence", modelDegraded=model_ready,
                             answer="已找到相关原文，请查看资料出处并核对适用条件。历史工单和案例供比对现场现象。\n\n" + condition)
     return data
 

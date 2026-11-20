@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Literal
 
@@ -10,6 +11,7 @@ from .common import actor, fail, get_db, need, permitted_device, revision, role
 from .conversations import redact, turn_view
 from .db import Job, Record, add, audit, cfg, enqueue, find, now, password_hash, records, timestamp
 from .library import queue_source
+from .knowledge import model_call
 from .worker import external_headers
 
 router = APIRouter()
@@ -209,9 +211,37 @@ def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
     return dict(alerts=alerts, jobs=[dict(id=job.id, kind=job.kind, state=job.state, attempts=job.attempts,
                            error=job.error) for job in jobs], audit=[row.view() for row in history],
                 submissions=[row.view("payload") for row in submissions],
-                integrations=dict(model=bool(cfg.model_url and cfg.allow_model_data and cfg.chat_model),
-                                  embedding=bool(cfg.embedding_model and cfg.allow_model_data), identity=bool(cfg.id_userinfo_url),
+                integrations=dict(model=bool(cfg.model_url and cfg.model_key and cfg.allow_model_data and cfg.chat_model),
+                                  embedding=bool(cfg.embedding_model and cfg.allow_model_data and not cfg.model_demo_only),
+                                  identity=bool(cfg.id_userinfo_url),
                                   registry=bool(cfg.registry_url), workorder=bool(cfg.workorder_url and cfg.workorder_enabled)))
+
+
+@router.post("/integrations/model/test")
+def test_model_connection(user=Depends(actor)):
+    role(user, "platform")
+    if not (cfg.model_url and cfg.model_key and cfg.chat_model):
+        fail(409, "MODEL_NOT_CONFIGURED", "请在本地 .env 填写 MODEL_URL、CHAT_MODEL 和 MODEL_KEY 后重启")
+    try:
+        response = model_call("chat/completions", {
+            "model": cfg.chat_model,
+            "temperature": 0,
+            "max_tokens": 96,
+            "response_format": {"type": "json_object"},
+            "messages": [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}],
+        }, connection_test=True)
+        if json.loads(response["choices"][0]["message"]["content"]).get("ok") is not True:
+            raise ValueError("Unexpected test response")
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        message = {401: "模型 API Key 无效或未授权", 402: "模型账户余额不足",
+                   403: "模型服务拒绝访问", 429: "模型服务暂时限流"}.get(status, f"模型服务返回 HTTP {status}")
+        fail(502, "MODEL_REQUEST_FAILED", message)
+    except httpx.RequestError:
+        fail(502, "MODEL_UNREACHABLE", "无法连接模型服务，请检查网络和接口地址")
+    except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+        fail(502, "MODEL_RESPONSE_INVALID", "模型未返回符合约定的 JSON，请检查模型名和接口协议")
+    return {"status": "ok", "model": cfg.chat_model}
 
 
 class SubmissionAction(BaseModel):

@@ -10,7 +10,20 @@
 .\start.ps1 -Demo
 ```
 
-打开 [http://127.0.0.1:5173/](http://127.0.0.1:5173/)。首页可直接用「E07 温度告警如何核对？」试查已发布示例手册和历史工单。点击右上角头像可以切换四个演示角色。演示数据存放在 `.local/maintenance.db`，正式空库默认使用 `.local/pilot.db`。演示模式下会保留诊断、工单及导入状态，并关闭模型数据出站与正式回写。
+打开 [http://127.0.0.1:5173/](http://127.0.0.1:5173/)。首页可直接用「E07 温度告警如何核对？」试查已发布示例手册和历史工单。点击右上角头像可以切换四个演示角色。演示数据存放在 `.local/maintenance.db`，正式空库默认使用 `.local/pilot.db`。演示模式默认使用本地检索，支持保留诊断、工单及导入状态。
+
+### 在演示环境接入 DeepSeek
+
+在项目目录的 `.env` 填写以下配置，将 `MODEL_KEY` 的值设为你的 DeepSeek API Key。
+
+```dotenv
+MODEL_URL=https://api.deepseek.com
+CHAT_MODEL=deepseek-flash
+MODEL_KEY=
+EMBEDDING_MODEL=
+```
+
+用 `.\start.ps1 -Demo -EnableModel` 启动。切换到平台管理员，在「系统管理 → 运行与审计」点击「测试模型连接」。连接测试使用固定测试内容。问答演示选系统内置的 IM-200 设备和 E07 样例，输入演示问题。默认只有内置演示资料可进入模型上下文。也可将已获准对外使用的公开资料版本 ID 加入 `.env` 中的 `MODEL_DEMO_SOURCE_IDS`，多个 ID 用逗号分隔。其余新增资料保持本地检索。DeepSeek 用于回答，语义向量留空时使用关键词检索。
 
 ## 导入正式资料
 

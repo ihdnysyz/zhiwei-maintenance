@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     embedding_min_similarity: float = 0.48
     rrf_k: int = 60
     allow_model_data: bool = False
+    model_demo_only: bool = False
+    model_demo_source_ids: str = ""
     id_userinfo_url: str = ""
     registry_url: str = ""
     integration_token: str = ""

@@ -456,6 +456,22 @@
         }
       }
     },
+    "/api/v1/integrations/model/test": {
+      "post": {
+        "summary": "Test Model Connection",
+        "operationId": "test_model_connection_api_v1_integrations_model_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/submissions/{submission_id}/actions": {
       "post": {
         "summary": "Check Submission",

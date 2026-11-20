@@ -228,7 +228,7 @@ def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request
     target.embedding = None
     target.embedding_model = ""
     keyword_only = row.data.get("keywordOnly", False)
-    if cfg.allow_model_data and cfg.embedding_model:
+    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_demo_only:
         from .conversations import redact
         try:
             target.embedding = embeddings([redact(body.text[:1800])])[0]
