@@ -32,8 +32,13 @@ const defaultPrompts = computed(() => [
   '设备出现振动与异响，有类似案例吗？',
   '有哪些适用于这台设备的维修手册？',
 ])
-const matchedDevices = computed(() => store.devices.filter(row =>
-  [row.name, row.model, row.number, row.batch].join(' ').toLowerCase().includes(deviceSearch.value.toLowerCase())))
+const matchedDevices = computed(() => {
+  const words = deviceSearch.value.normalize('NFKC').toLowerCase().trim().split(/\s+/)
+  return store.devices.filter(row => {
+    const description = [row.name, row.model, row.number, row.batch, row.location].join(' ').normalize('NFKC').toLowerCase()
+    return words.every(word => description.includes(word))
+  })
+})
 const safeScroll = () => nextTick(() => bottom.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))
 async function history() { sessions.value = await api<Row[]>('/sessions') }
 onMounted(() => history().catch(error => notice(errorMessage(error), true)))
@@ -92,6 +97,11 @@ async function selectDevice(row: Row) {
     if (question.value === route.query.q) question.value = ''
     await router.replace('/ask')
   }
+}
+function useSuggestedDevice(item: Row, turn: Row) {
+  const text = item.category === 'case' ? `请查找案例《${item.title}》`
+    : item.category === 'workorder' ? `请查找历史工单《${item.title}》` : turn.text
+  void router.push({ path: '/ask', query: { device: item.id, q: text } }).then(() => composer.value?.focus())
 }
 async function send() {
   const text = question.value.trim()
@@ -166,14 +176,23 @@ async function escalate() {
         <div class="chat-head">
           <button class="icon-btn mobile-history" aria-label="诊断记录" @click="showHistory = !showHistory"><History :size="20"/></button>
           <div class="device-select">
-            <button class="btn device-btn" :aria-expanded="pickDevice" @click="pickDevice = !pickDevice"><Cpu :size="18"/><span>{{ currentDevice ? currentDevice.number + ' · ' + currentDevice.name : '选择设备' }}</span><ChevronDown :size="15"/></button>
+            <button class="btn device-btn" :aria-expanded="pickDevice" @click="pickDevice = !pickDevice">
+              <Cpu :size="18"/>
+              <span v-if="currentDevice" class="device-label">
+                <b>{{ currentDevice.name }}</b>
+                <small class="chat-model">{{ currentDevice.model }}{{ currentDevice.batch ? ' · 批次 ' + currentDevice.batch : '' }}{{ currentDevice.demo ? ' · 演示设备' : '' }}</small>
+              </span>
+              <span v-else>选择设备</span><ChevronDown :size="15"/>
+            </button>
             <div v-if="pickDevice" class="device-options">
-              <label class="search-field"><Search :size="16"/><input v-model="deviceSearch" placeholder="搜索编号、名称或型号" aria-label="搜索设备"/></label>
-              <button v-for="item in matchedDevices" :key="item.id" @click="selectDevice(item)"><b>{{ item.number }} · {{ item.name }}</b><small>{{ item.model }} {{ item.batch }}</small></button>
+              <label class="search-field"><Search :size="16"/><input v-model="deviceSearch" placeholder="搜索名称、型号、批次或位置" aria-label="搜索设备"/></label>
+              <button v-for="item in matchedDevices" :key="item.id" :class="{ selected: item.id === deviceId }" @click="selectDevice(item)">
+                <b>{{ item.name }}{{ item.id === deviceId ? ' · 当前' : '' }}</b>
+                <small>{{ item.number }} · {{ item.model }}{{ item.batch ? ' · 批次 ' + item.batch : '' }}</small>
+              </button>
               <p v-if="!matchedDevices.length" class="muted">没有匹配的设备。请联系管理员维护台账。</p>
             </div>
           </div>
-          <span v-if="currentDevice" class="chat-model">{{ currentDevice.model }}{{ currentDevice.demo ? ' · 演示设备' : '' }}</span>
           <button class="icon-btn mobile-history" aria-label="新建诊断" @click="newSession"><Plus :size="20"/></button>
         </div>
         <div class="chat-messages">
@@ -193,6 +212,14 @@ async function escalate() {
                 <div v-if="turn.citations?.length" class="citations">
                   <h3><BookOpen :size="16"/> {{ turn.decision === 'evidence' ? '相关资料' : '资料出处' }}</h3>
                   <button v-for="(item, index) in turn.citations" :key="item.id" @click="evidence = item"><span class="ref-index">{{ index + 1 }}</span><span><b>{{ item.title }}</b><small>{{ item.demo ? '演示样例 · ' : '' }}{{ categories[item.category] }} · {{ item.position }} · V{{ item.version }}</small></span><ChevronRight :size="17"/></button>
+                </div>
+                <div v-if="turn.deviceSuggestions?.length" class="citations">
+                  <h3><Cpu :size="16"/> 其他设备有匹配资料</h3>
+                  <button v-for="item in turn.deviceSuggestions" :key="item.id" @click="useSuggestedDevice(item, turn)">
+                    <Cpu :size="17"/><span><b>{{ item.name }}</b>
+                      <small>{{ item.model }}{{ item.batch ? ' · 批次 ' + item.batch : '' }}</small>
+                      <small>{{ categories[item.category] }} · {{ item.title }}</small></span><ArrowRight :size="17"/>
+                  </button>
                 </div>
                 <div class="tag-row"><button class="text-link escalate" @click="feedback = false; escalateTurn = turn"><Users :size="16"/> 转交专家</button><button class="text-link escalate" @click="feedback = true; escalateTurn = turn">反馈答复</button></div>
               </template>

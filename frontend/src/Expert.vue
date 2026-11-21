@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ArrowUpRight, BookOpen, ChevronRight, ClipboardCheck, MessageSquare, Users, X } from 'lucide-vue-next'
+import { useRouter } from 'vue-router'
 import { api, date, errorMessage, notice, statuses, store, type Row } from './store'
 
 const tasks = ref<Row[]>([])
+const router = useRouter()
 const completed = ref<Row[]>([])
 const selected = ref<Row | null>(null)
 const record = ref<Row | null>(null)
@@ -14,6 +16,8 @@ const error = ref('')
 const busy = ref(false)
 const caseLoading = ref(false)
 const caseError = ref('')
+let caseTimer: number | undefined
+let active = true
 const expert = computed(() => store.profile?.role === 'expert')
 const manage = computed(() => expert.value || store.profile?.role === 'library')
 async function load() {
@@ -22,12 +26,22 @@ async function load() {
   } catch (e) { notice(errorMessage(e), true) }
 }
 onMounted(load)
+onUnmounted(() => { active = false; clearTimeout(caseTimer) })
 async function openCases() {
   tab.value = 'cases'
+  await loadCases()
+}
+async function loadCases() {
+  clearTimeout(caseTimer)
   if (caseLoading.value) return
   caseLoading.value = true
   caseError.value = ''
-  try { completed.value = await api<Row[]>('/completed') }
+  try {
+    completed.value = await api<Row[]>('/completed')
+    if (active && tab.value === 'cases' && completed.value.some(row => row.caseSource?.status === 'queued')) {
+      caseTimer = window.setTimeout(() => { if (tab.value === 'cases') void loadCases() }, 1200)
+    }
+  }
   catch (e) { caseError.value = errorMessage(e) }
   finally { caseLoading.value = false }
 }
@@ -37,6 +51,10 @@ async function open(row: Row) {
   catch (e) { notice(errorMessage(e), true) }
 }
 function openCase(row: Row) {
+  if (row.caseSource) {
+    void router.push({ path: '/library', query: { source: row.caseSource.id } })
+    return
+  }
   record.value = row
   note.value = [
     '适用设备：' + row.device.model + (row.device.batch ? ' / ' + row.device.batch : ''),
@@ -65,7 +83,8 @@ async function sendCase() {
   try {
     await api('/drafts/' + record.value.id + '/case', 'POST', { text: note.value })
     record.value = null; note.value = ''
-    notice('案例已进入知识库校核队列')
+    notice('案例已送校核，审核通过后会自动发布')
+    await openCases()
   } catch (e) { error.value = errorMessage(e) }
   finally { busy.value = false }
 }
@@ -80,10 +99,10 @@ async function sendCase() {
         <button v-for="row in tasks" :key="row.id" class="source-row" @click="open(row)"><span class="tile-icon mint"><MessageSquare :size="20"/></span><span class="source-main"><b>{{ row.title }}</b><small>{{ row.deviceName }} · {{ date(row.updated, true) }}</small></span><span v-if="row.overdue" class="pill">已逾期</span><span class="pill">{{ statuses[row.status] }}</span><ChevronRight :size="17"/></button>
       </template>
       <template v-else>
-        <div v-if="caseLoading" class="empty" role="status">正在读取已结单记录…</div>
+        <div v-if="caseLoading && !completed.length" class="empty" role="status">正在读取已结单记录…</div>
         <div v-else-if="caseError" class="empty"><p class="error" role="alert">{{ caseError }}</p><button class="btn secondary" @click="openCases">重新读取</button></div>
         <div v-else-if="!completed.length" class="empty"><ClipboardCheck :size="34"/><b>暂无可回流的已结单记录</b><p>请由维修人员在工单详情点击「确认外部工单已结单」。</p></div>
-        <template v-else><button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">整理案例</span><ChevronRight :size="17"/></button></template>
+        <template v-else><button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">{{ row.caseSource ? (row.caseSource.active ? '案例已生效' : '案例 · ' + (row.caseSource.status === 'published' ? '未生效' : statuses[row.caseSource.status])) : '整理案例' }}</span><ChevronRight :size="17"/></button></template>
       </template>
     </section>
     <div v-if="selected || record" class="backdrop" @click="selected = null; record = null"></div>

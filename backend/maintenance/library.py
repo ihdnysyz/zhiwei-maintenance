@@ -272,6 +272,35 @@ def parse_date(value):
         fail(422, "INVALID_DATE", "生效时间需要带时区")
 
 
+def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", batch_override=None):
+    data = source.data
+    org = source.org
+    if not data.get("indexReady") or data.get("approvedDigest") != data.get("digest"):
+        fail(409, "INDEX_REQUIRED", "已审核摘要或索引尚未就绪")
+    need(find(db, org, "family", key=data["number"], lock=True))
+    current_time = datetime.now(timezone.utc)
+    start = parse_date(start_at) if start_at else current_time
+    end = parse_date(end_at) if end_at else None
+    if start < current_time or end and end <= start:
+        fail(422, "SCOPE_INTERVAL", "生效时间须在当前或未来，且结束时间晚于开始时间")
+    batch = data["batch"]
+    if not bind and not batch and batch_override is not None:
+        batch = batch_override.strip()
+    matching = scopes(org).where(Scope.number == data["number"],
+                                 Scope.model == data["model"], Scope.batch == batch,
+                                 (Scope.end.is_(None) | (Scope.end > start)))
+    if end:
+        matching = matching.where(Scope.start < end)
+    for scope in db.scalars(matching.with_for_update()):
+        if scope.start.replace(tzinfo=scope.start.tzinfo or timezone.utc) >= start:
+            fail(409, "SCOPE_OVERLAP", "存在冲突的预定生效区间")
+        scope.end = start
+    db.flush()
+    db.add(Scope(org=org, status="bind" if bind else "block", number=data["number"],
+                 source=source.id, model=data["model"], batch=batch, start=start, end=end))
+    source.change("published" if bind or batch != data["batch"] else "withdrawn")
+
+
 @router.post("/sources/{source_id}/actions")
 def action(source_id: str, body: SourceAction, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "expert" if body.action in {"approve", "reject"} else "library")
@@ -297,32 +326,12 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
             fail(409, "MODEL_APPROVAL_DISABLED", "当前未启用按资料授权的回答模型")
         source.change("approved" if approved else "returned", reviewer=user.key, note=body.note,
                       approvedDigest=data.get("digest") if approved else "", approvedModelEndpoint=endpoint_key)
+        if approved and data["category"] == "case" and data.get("workorderLocator"):
+            apply_publication_scope(db, source)
+            audit(db, user.org, user.key, "资料·审核后自动发布", source.id, request.state.request_id)
     elif body.action in {"publish", "block"} and source.status in {"approved", "published", "withdrawn"}:
-        if not data.get("indexReady") or data.get("approvedDigest") != data.get("digest"):
-            fail(409, "INDEX_REQUIRED", "已审核摘要或索引尚未就绪")
-        need(find(db, user.org, "family", key=data["number"], lock=True))
-        current_time = datetime.now(timezone.utc)
-        start = parse_date(body.start) if body.start else current_time
-        end = parse_date(body.end) if body.end else None
-        if start < current_time or end and end <= start:
-            fail(422, "SCOPE_INTERVAL", "生效时间须在当前或未来，且结束时间晚于开始时间")
-        batch = data["batch"]
-        if body.action == "block" and not batch and body.batch is not None:
-            batch = body.batch.strip()
-        matching = scopes(user.org).where(Scope.number == data["number"],
-                                          Scope.model == data["model"], Scope.batch == batch,
-                                          (Scope.end.is_(None) | (Scope.end > start)))
-        if end:
-            matching = matching.where(Scope.start < end)
-        for scope in db.scalars(matching.with_for_update()):
-            if scope.start.replace(tzinfo=scope.start.tzinfo or timezone.utc) >= start:
-                fail(409, "SCOPE_OVERLAP", "存在冲突的预定生效区间")
-            scope.end = start
-        db.flush()
-        bind = body.action == "publish"
-        db.add(Scope(org=user.org, status="bind" if bind else "block", number=data["number"],
-                     source=source.id, model=data["model"], batch=batch, start=start, end=end))
-        source.change("published" if bind or batch != data["batch"] else "withdrawn")
+        apply_publication_scope(db, source, bind=body.action == "publish", start_at=body.start,
+                                end_at=body.end, batch_override=body.batch)
     else:
         fail(409, "SOURCE_STATE", "当前资料状态不支持此操作")
     audit(db, user.org, user.key, "资料·" + body.action, source.id, request.state.request_id)

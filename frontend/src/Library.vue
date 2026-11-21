@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ArrowDownToLine, ArrowUpRight, BookOpen, ClipboardList, CloudUpload, FileSearch, FileText, History, Plus, RefreshCw, Search, Wrench, X } from 'lucide-vue-next'
+import { useRoute } from 'vue-router'
 import { api, categories, date, errorMessage, notice, statuses, store, type Row } from './store'
 
 interface UploadItem { file: File; title: string; number: string; version: string; model: string; batch: string; category: string; referenceUrl: string }
+const route = useRoute()
 const sources = ref<Row[]>([])
 const batches = ref<Row[]>([])
 const detail = ref<Row | null>(null)
@@ -36,7 +38,17 @@ const filtered = computed(() => sources.value.filter(source =>
   (!type.value || source.category === type.value) && (!filterStatus.value || source.status === filterStatus.value)
   && (searchResult.value !== null || !term.value || [source.title, source.number, source.model, source.batch].join(' ').toLowerCase().includes(term.value.toLowerCase()))))
 const categoryIcons = { manual: BookOpen, workorder: ClipboardList, case: Wrench }
+const filteredSearch = computed(() => {
+  const matchingSources = filterStatus.value
+    ? new Set(sources.value.filter(row => row.status === filterStatus.value).map(row => row.id))
+    : null
+  return (searchResult.value || []).filter(row => (!type.value || row.category === type.value)
+    && (!matchingSources || matchingSources.has(row.sourceId)))
+})
 let timer: number | undefined
+let searchGeneration = 0
+let detailGeneration = 0
+let loadingDetail = false
 async function fetchData() {
   try {
     sources.value = await api<Row[]>('/sources')
@@ -44,26 +56,45 @@ async function fetchData() {
   } catch (error) { notice(errorMessage(error), true) }
   finally { ready.value = true }
 }
-onMounted(() => { void fetchData(); timer = window.setInterval(() => { if (showBatches.value) void fetchData() }, 2500) })
-onUnmounted(() => clearInterval(timer))
+onMounted(() => {
+  void fetchData().then(() => {
+    const source = sources.value.find(row => row.id === route.query.source)
+    if (source) void view(source)
+  })
+  timer = window.setInterval(() => {
+    if (showBatches.value) void fetchData()
+    if (detail.value?.status === 'queued' && !loadingDetail) void view(detail.value)
+  }, 1500)
+})
+onUnmounted(() => { clearInterval(timer); clearSearch(); detailGeneration++ })
+function clearSearch() {
+  searchGeneration++
+  searchResult.value = null
+}
 async function search() {
-  if (!term.value.trim()) { searchResult.value = null; return }
-  if (!deviceId.value) { searchResult.value = null; return }
-  try { searchResult.value = await api<Row[]>('/knowledge/search?' + new URLSearchParams({ deviceId: deviceId.value, q: term.value.trim() })) }
-  catch (error) { notice(errorMessage(error), true) }
+  const generation = ++searchGeneration
+  if (!term.value.trim() || !deviceId.value) { searchResult.value = null; return }
+  try {
+    const results = await api<Row[]>('/knowledge/search?' + new URLSearchParams({ deviceId: deviceId.value, q: term.value.trim() }))
+    if (generation === searchGeneration) searchResult.value = results
+  }
+  catch (error) { if (generation === searchGeneration) notice(errorMessage(error), true) }
 }
 async function view(row: Row) {
+  const generation = ++detailGeneration
+  loadingDetail = true
   verified.value = false
   allowExternalModel.value = false
   correctionId.value = ''
   actionNote.value = ''
   startAt.value = ''; endAt.value = ''; schedule.value = false; blockBatch.value = ''; errorText.value = ''
-  const viewDeviceId = row.applicableDeviceId || deviceId.value
+  const viewDeviceId = row.applicableDeviceId || row.viewDeviceId || deviceId.value
   try {
     const source = await api<Row>('/sources/' + row.id + '?' + new URLSearchParams({ deviceId: viewDeviceId }))
-    detail.value = { ...source, viewDeviceId }
+    if (generation === detailGeneration) detail.value = { ...source, viewDeviceId }
   }
-  catch (error) { notice(errorMessage(error), true) }
+  catch (error) { if (generation === detailGeneration) notice(errorMessage(error), true) }
+  finally { if (generation === detailGeneration) loadingDetail = false }
 }
 async function saveCorrection(id: string) {
   if (!detail.value || working.value) return
@@ -140,7 +171,7 @@ async function action(name: string) {
   finally { working.value = false }
 }
 const filename = (row: Row) => row.filename || row.number
-function closeDetail() { detail.value = null; errorText.value = '' }
+function closeDetail() { detailGeneration++; loadingDetail = false; detail.value = null; errorText.value = '' }
 </script>
 
 <template>
@@ -156,16 +187,16 @@ function closeDetail() { detail.value = null; errorText.value = '' }
     </section>
     <section v-else class="card list-card">
       <div class="list-tools">
-        <form class="search-field" @submit.prevent="search"><Search :size="18"/><input v-model="term" placeholder="搜索标题、编号、故障码或现象" aria-label="搜索资料" @input="searchResult = null"/><button v-if="term" type="button" class="icon-btn" aria-label="清空搜索" @click="term = ''; searchResult = null"><X :size="17"/></button><button class="btn subtle">搜索原文</button></form>
-        <select v-model="deviceId" aria-label="适用设备" @change="searchResult = null"><option value="">选择适用设备</option><option v-for="row in store.devices" :key="row.id" :value="row.id">{{ row.number }} · {{ row.name }}</option></select>
+        <form class="search-field" @submit.prevent="search"><Search :size="18"/><input v-model="term" placeholder="搜索标题、编号、故障码或现象" aria-label="搜索资料" @input="clearSearch"/><button v-if="term" type="button" class="icon-btn" aria-label="清空搜索" @click="term = ''; clearSearch()"><X :size="17"/></button><button class="btn subtle">搜索原文</button></form>
+        <select v-model="deviceId" aria-label="适用设备" @change="clearSearch"><option value="">选择适用设备</option><option v-for="row in store.devices" :key="row.id" :value="row.id">{{ row.number }} · {{ row.name }}</option></select>
       </div>
       <div class="filters">
         <div class="tabs"><button v-for="(label, key) in { '': '全部资料', ...categories }" :key="key" :class="{ on: type === key }" @click="type = key">{{ label }}</button></div>
         <select v-if="manager || expert" v-model="filterStatus" aria-label="按状态筛选"><option value="">全部状态</option><option v-for="key in ['queued','calibration','review','approved','published','withdrawn','returned','failed']" :key="key" :value="key">{{ statuses[key] }}</option></select>
       </div>
       <div v-if="searchResult !== null" class="source-list">
-        <div v-if="!searchResult.length" class="empty"><FileSearch :size="34"/><b>没有匹配的原文</b><p>试试缩短关键词，或选择正确的设备。</p></div>
-        <button v-for="item in searchResult.filter(row => !type || row.category === type)" :key="item.id" class="source-row" @click="view({ ...item, id: item.sourceId })">
+        <div v-if="!filteredSearch.length" class="empty"><FileSearch :size="34"/><b>没有匹配的原文</b><p>可以调整关键词或筛选条件。</p></div>
+        <button v-for="item in filteredSearch" :key="item.id" class="source-row" @click="view({ ...item, id: item.sourceId })">
           <span class="tile-icon mint"><FileText :size="21"/></span><span class="source-main"><b>{{ item.title }}</b><small>{{ item.position }} · {{ item.text.slice(0, 116) }}</small></span><span class="pill">{{ categories[item.category] }}</span>
         </button>
       </div>
@@ -241,13 +272,13 @@ function closeDetail() { detail.value = null; errorText.value = '' }
             <input v-model="allowExternalModel" type="checkbox"/>
             允许将本版本的相关摘录和提问发送给回答模型（{{ detail.modelApprovalHost }}）
           </label>
-          <div class="button-row"><button class="btn secondary" :disabled="!actionNote.trim() || working" @click="action('reject')">退回校核</button><button class="btn primary" :disabled="working" @click="action('approve')">审核通过</button></div>
+          <div class="button-row"><button class="btn secondary" :disabled="!actionNote.trim() || working" @click="action('reject')">退回校核</button><button class="btn primary" :disabled="working" @click="action('approve')">{{ detail.category === 'case' && detail.workorderLocator ? '审核通过并发布' : '审核通过' }}</button></div>
         </template>
         <template v-if="manager && ['approved','published','withdrawn'].includes(detail.status)">
           <label class="check"><input v-model="schedule" type="checkbox"/> 指定生效时间</label>
           <div v-if="schedule" class="form-grid"><label>开始时间<input v-model="startAt" type="datetime-local"/></label><label>结束时间<input v-model="endAt" type="datetime-local"/></label></div>
           <label v-if="detail.active && !detail.batch">下架批次<input v-model="blockBatch" placeholder="留空下架整个型号范围" maxlength="80"/></label>
-          <div class="button-row"><button v-if="detail.active" class="btn secondary" :disabled="working" @click="action('block')">下架适用范围</button><button class="btn primary" :disabled="working" @click="action('publish')">发布该版本</button></div>
+          <div class="button-row"><button v-if="detail.active" class="btn secondary" :disabled="working" @click="action('block')">下架适用范围</button><button v-if="!detail.active || schedule" class="btn primary" :disabled="working" @click="action('publish')">发布该版本</button></div>
         </template>
         <p v-if="errorText" class="error" role="alert">{{ errorText }}</p>
       </div>

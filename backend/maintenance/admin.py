@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from .common import actor, fail, get_db, need, permitted_device, revision, role
 from .conversations import redact, turn_view
-from .db import Job, Record, add, audit, cfg, enqueue, find, now, password_hash, records, timestamp
+from .db import Job, Record, Scope, add, audit, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
 from .library import queue_source
 from .knowledge import model_call
 from .worker import external_headers
@@ -176,14 +176,21 @@ def task_action(task_id: str, body: TaskAction, request: Request, user=Depends(a
 @router.post("/drafts/{draft_id}/case")
 def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library", "expert")
-    row = need(find(db, user.org, "draft", id=draft_id))
+    row = need(find(db, user.org, "draft", id=draft_id, lock=True))
     device = row.data["device"]
     if row.status != "linked" or not row.data.get("completedAt") or not permitted_device(user, device):
         fail(409, "CASE_NOT_ELIGIBLE", "需要已登记工单及相应设备权限")
     number = f"CASE-{row.id[:12]}"
+    text = redact(body.text).encode()
+    existing = find(db, user.org, "source", key=f"{number}:1.0")
+    if existing:
+        if (existing.data.get("category") == "case" and permitted_device(user, existing.data)
+                and existing.data.get("workorderLocator") == row.data["externalNumber"] and existing.blob == text):
+            return existing.view("digest", "approvedModelEndpoint")
+        fail(409, "CASE_ALREADY_SUBMITTED", "该工单已有案例，请在案例回流中打开原记录继续维护")
     info = dict(number=number, version="1.0", title=f"{device['model']} 已结单经验案例",
                 model=device["model"], batch=device["batch"], category="case")
-    case, _ = queue_source(db, user.org, user.key, info, "脱敏案例.txt", redact(body.text).encode())
+    case, _ = queue_source(db, user.org, user.key, info, "脱敏案例.txt", text)
     case.change(workorderLocator=row.data["externalNumber"])
     audit(db, user.org, user.key, "工单案例回流", case.id, request.state.request_id)
     return case.view("digest")
@@ -192,9 +199,25 @@ def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(acto
 @router.get("/completed")
 def completed(user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library", "expert")
-    return [row.view("snapshot", "changes", "origins") for row in db.scalars(
-        records(user.org, "draft").where(Record.status == "linked").order_by(Record.updated.desc()).limit(100))
-        if row.data.get("completedAt") and permitted_device(user, row.data["device"])]
+    eligible = records(user.org, "draft").where(Record.status == "linked",
+                                                Record.data["completedAt"].as_string() != "")
+    models = user.data.get("models")
+    if models:
+        eligible = eligible.where(Record.data["device"]["model"].as_string().in_(models))
+    drafts = list(db.scalars(eligible.order_by(Record.updated.desc()).limit(100)))
+    keys = {row.id: f"CASE-{row.id[:12]}:1.0" for row in drafts}
+    sources = {row.key: row for row in db.scalars(records(user.org, "source").where(Record.key.in_(keys.values())))
+               if permitted_device(user, row.data)}
+    active = {row.source for row in db.scalars(current_scopes(user.org).where(
+        Scope.status == "bind", Scope.source.in_({row.id for row in sources.values()})))}
+    result = []
+    for draft in drafts:
+        item = draft.view("snapshot", "changes", "origins")
+        case = sources.get(keys[draft.id])
+        if case:
+            item["caseSource"] = dict(id=case.id, status=case.status, active=case.id in active)
+        result.append(item)
+    return result
 
 
 @router.get("/operations")

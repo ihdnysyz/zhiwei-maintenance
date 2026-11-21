@@ -19,6 +19,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import func, select, type_coerce
 from sqlalchemy.orm import defer
 
+from .common import permitted_device
 from .db import Chunk, Record, Scope, cfg, current_scopes, digest, find, records, set_org
 
 KINDS = {"manual": "维修手册", "workorder": "历史工单", "case": "故障案例"}
@@ -33,6 +34,7 @@ SAFETY = re.compile(
     r"emergency stop|reset|restart|shut\s*down|power (?:off|on)|safety interlock)\b", re.I
 )
 MODEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
+_model_http = httpx.Client()
 
 
 def model_approval_endpoint():
@@ -194,7 +196,7 @@ def model_call(endpoint, payload, *, connection_test=False):
     attempts = 2 if endpoint == "chat/completions" and not connection_test else 1
     for attempt in range(attempts):
         try:
-            response = httpx.post(url, headers=headers, json=payload, timeout=12, follow_redirects=False)
+            response = _model_http.post(url, headers=headers, json=payload, timeout=12, follow_redirects=False)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as exc:
@@ -253,8 +255,12 @@ def terms(value):
     return Counter(tokens)
 
 
+def normalize_code_text(value):
+    return normalize("NFKC", value).translate(str.maketrans("–—−", "---"))
+
+
 def codes_in(value):
-    value = normalize("NFKC", value).translate(str.maketrans("–—−", "---"))
+    value = normalize_code_text(value)
     return {match.upper() for pattern in (CODES, LABELLED_CODE) for match in pattern.findall(value)}
 
 
@@ -266,6 +272,75 @@ def fault_codes(value, device):
     identifiers = codes_in(f"{device.get('number', '')} {device.get('model', '')}")
     device_keys = {code_key(code) for code in identifiers}
     return {code for code in codes_in(value) if code_key(code) not in device_keys}
+
+
+_LOOKUP_FILLER = re.compile(
+    r"有没有|能否|是否有|怎么处理|怎么办|出现了?|发生了?|故障码|故障|异常|复盘|案例|历史工单|"
+    r"厂家目录|维修手册|手册|目录|资料|请问|核对|查询|相关|记录|什么|哪[些个]|怎么|如何|一下|的|吗|了"
+)
+_DIAGNOSIS_CUE = re.compile(r"故障|异常|告警|报警|振动|异响|复盘|案例|工单|损坏")
+
+
+def suggested_device_refs(db, user, device, query, candidates):
+    if len(query) > 100 or SAFETY.search(query):
+        return []
+    faults = {code_key(code) for code in fault_codes(query, device)}
+    if not faults and not _DIAGNOSIS_CUE.search(query):
+        return []
+    subject = _LOOKUP_FILLER.sub(" ", query.strip())
+    phrases = set(re.findall(r"[\u4e00-\u9fff]{2,}", subject))
+    if not faults and not phrases:
+        return []
+
+    def score(title, position, body, *, current=False):
+        if faults:
+            codes = {code_key(code) for code in codes_in(f"{title} {position} {body}")}
+            return len(faults) if faults <= codes else 0
+        location = f"{title} {position} {body}" if current else title
+        return max((len(phrase) for phrase in phrases if phrase in location), default=0)
+
+    if any(score(item["title"], item["position"], item["text"], current=True) for item in candidates):
+        return []
+
+    current_ids, _ = applicability(db, user.org, device)
+    devices = {}
+    for row in db.scalars(records(user.org, "device").order_by(Record.key)):
+        pair = row.data["model"], row.data["batch"]
+        if pair != (device["model"], device["batch"]) and permitted_device(user, row.data):
+            devices.setdefault(pair, row)
+    if not devices:
+        return []
+
+    by_source = defaultdict(list)
+    for scope in db.scalars(current_scopes(user.org).where(
+            Scope.status == "bind", Scope.model.in_({model for model, _ in devices} | {"*"}))):
+        if scope.source not in current_ids:
+            by_source[scope.source].append(scope)
+    if not by_source:
+        return []
+
+    ranked = []
+    chunks = select(Chunk, Record.data).join(Record, Record.id == Chunk.source).where(
+        Chunk.org == user.org, Chunk.source.in_(by_source), Record.org == user.org).options(defer(Chunk.embedding))
+    for chunk, data in db.execute(chunks):
+        relevance = score(data["title"], chunk.position, chunk.body)
+        if relevance:
+            ranked.append((relevance, data["category"] == "manual", data["title"], chunk))
+
+    suggestions, checked = {}, {}
+    for _, _, _, chunk in sorted(ranked, key=lambda row: (-row[0], -row[1], row[2], row[3].id)):
+        for scope in by_source[chunk.source]:
+            for (model, batch), target in devices.items():
+                if target.id in suggestions or scope.model not in {"*", model} or scope.batch not in {"", batch}:
+                    continue
+                if target.id not in checked:
+                    checked[target.id] = applicability(db, user.org, target.data)
+                ids, ambiguous = checked[target.id]
+                if not ambiguous and chunk.source in ids:
+                    suggestions[target.id] = {"deviceId": target.id, "chunkId": chunk.id}
+                if len(suggestions) == 3:
+                    return list(suggestions.values())
+    return list(suggestions.values())
 
 
 def retrieve(db, org, device, query, limit=6):

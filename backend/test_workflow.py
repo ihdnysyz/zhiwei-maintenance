@@ -93,6 +93,15 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     assert listed["applicableDeviceId"] == first["id"]
     assert get(client, f"/sources/{source_id}?deviceId={first['id']}")["active"]
     get(client, f"/sources/{source_id}?deviceId={second['id']}", 404)
+    other_session = post(client, "/sessions", {"deviceId": second["id"]}, 201)
+    other_turns = f"/sessions/{other_session['id']}/turns"
+    other_turn = post(client, other_turns, {"text": "K81", "clientMessageId": uuid4().hex}, 202)
+    do_job(worker, "turn")
+    hint_url = f"{other_turns}/{other_turn['id']}"
+    hint = get(client, hint_url)
+    assert hint["decision"] == "no_evidence" and not hint["citations"]
+    assert [row["id"] for row in hint["deviceSuggestions"]] == [first["id"]]
+    assert hint["deviceSuggestions"][0]["title"] == info["title"]
     session = post(client, "/sessions", dict(deviceId=first["id"]), 201)
     url = f"/sessions/{session['id']}/turns"
     message = {"text": "K81 示例记录提示怎么核对？", "clientMessageId": uuid4().hex}
@@ -164,13 +173,44 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     task = post(client, f"/tasks/{task['id']}/actions", {"revision": task["revision"], "action": "reply", "note": "班组已复核。"})
     assert task["status"] == "answered"
     assert get(client, "/completed")[0]["id"] == draft["id"]
-    case = post(client, draft_url + "/case", {"text": "已核实适用条件和处置结果。样本联系方式 13812345678 应当脱敏。"})
+    post(client, "/auth/demo", {"role": "library"})
+    case_input = {"text": "K81 已核实适用条件和处置结果。样本联系方式 13812345678 应当脱敏。"}
+    case = post(client, draft_url + "/case", case_input)
+    retried = post(client, draft_url + "/case", case_input)
+    assert retried["id"] == case["id"] and retried["revision"] == case["revision"]
+    conflict = post(client, draft_url + "/case", {"text": "K81 重试输入改动了既有案例，不应生成隐形冲突。"}, 409)
+    assert conflict["code"] == "CASE_ALREADY_SUBMITTED"
     do_job(worker, "parse")
     case = get(client, f"/sources/{case['id']}")
     assert "13812345678" not in case["chunks"][0]["text"]
+    assert get(client, "/completed")[0]["caseSource"] == dict(id=case["id"], status="calibration", active=False)
+    post(client, "/auth/demo", {"role": "tech"})
+    search_url = f"/knowledge/search?deviceId={first['id']}&q=K81"
+    assert all(row["sourceId"] != case["id"] for row in get(client, search_url))
+    post(client, "/auth/demo", {"role": "library"})
+    case_url = f"/sources/{case['id']}/actions"
+    case = post(client, case_url, dict(action="review", revision=case["revision"], verified=True))
+    post(client, "/auth/demo", {"role": "expert"})
+    case = post(client, case_url, dict(action="reject", revision=case["revision"], note="补充验收记录"))
+    assert case["status"] == "returned"
+    assert get(client, "/completed")[0]["caseSource"] == dict(id=case["id"], status="returned", active=False)
+    post(client, "/auth/demo", {"role": "library"})
+    case = post(client, case_url, dict(action="review", revision=case["revision"], verified=True))
+    post(client, "/auth/demo", {"role": "expert"})
+    case = post(client, case_url, dict(action="approve", revision=case["revision"]))
+    assert case["status"] == "published"
+    assert get(client, "/completed")[0]["caseSource"] == dict(id=case["id"], status="published", active=True)
     post(client, "/auth/demo", {"role": "library"})
     post(client, f"/sources/{source_id}/actions", {"revision": source["revision"], "action": "block"})
     post(client, "/auth/demo", {"role": "tech"})
+    assert any(row["sourceId"] == case["id"] for row in get(client, search_url))
+    assert not get(client, f"/knowledge/search?deviceId={second['id']}&q=K81")
+    assert not get(client, hint_url)["deviceSuggestions"]
+    case_session = post(client, "/sessions", {"deviceId": first["id"]}, 201)
+    case_turns = f"/sessions/{case_session['id']}/turns"
+    case_turn = post(client, case_turns, {"text": "K81 有哪些已结单案例？", "clientMessageId": uuid4().hex}, 202)
+    do_job(worker, "turn")
+    assert [row["sourceId"] for row in get(client, f"{case_turns}/{case_turn['id']}")["citations"]] == [case["id"]]
     assert get(client, f"{url}/{turn['id']}")["decision"] == "expired"
 
 
@@ -280,7 +320,7 @@ def test_deepseek_connection_probe_uses_fixed_prompt(services, monkeypatch):
         return httpx.Response(200, request=httpx.Request("POST", url),
                               json={"choices": [{"message": {"content": '{"ok":true}'}}]})
 
-    monkeypatch.setattr(knowledge.httpx, "post", send)
+    monkeypatch.setattr(knowledge._model_http, "post", send)
     assert post(client, "/integrations/model/test") == {"status": "ok", "model": "deepseek-flash"}
     assert outbound[0]["messages"] == [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}]
     assert outbound[0]["thinking"] == {"type": "disabled"}
@@ -326,15 +366,19 @@ def test_answer_shows_only_the_sources_it_cites(services, monkeypatch):
     client, worker = services
     post(client, "/auth/demo", {"role": "tech"})
     device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
-    text = "E07 温度告警是什么？"
+    text = "ｅ－０７ 温度告警是什么？"
     candidates = get(client, f"/knowledge/search?deviceId={device['id']}&q={text}")
     assert {row["number"] for row in candidates} == {"MAN-001", "WO-001"}
     monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
     monkeypatch.setattr(conversations.cfg, "chat_model", "validation-chat")
-    monkeypatch.setattr(conversations, "model_call", lambda *_: {
-        "choices": [{"message": {"content": json.dumps({
+    def model_reply(_, payload):
+        message = json.loads(payload["messages"][-1]["content"])
+        assert message["normalizedFaultCodes"] == ["E07"]
+        return {"choices": [{"message": {"content": json.dumps({
             "claims": [{"id": 1, "quote": "示例故障码 E07 表示温度告警。"}],
-        })}}]})
+        })}}]}
+
+    monkeypatch.setattr(conversations, "model_call", model_reply)
     session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
     url = f"/sessions/{session['id']}/turns"
     turn = post(client, url, {"text": text, "clientMessageId": uuid4().hex}, 202)
@@ -355,7 +399,7 @@ def test_chat_retries_temporary_provider_failure(services, monkeypatch):
     def send(url, **kwargs):
         return httpx.Response(next(codes), request=httpx.Request("POST", url), json={"choices": []})
 
-    monkeypatch.setattr(knowledge.httpx, "post", send)
+    monkeypatch.setattr(knowledge._model_http, "post", send)
     assert knowledge.model_call("chat/completions", {}) == {"choices": []}
     with pytest.raises(httpx.HTTPStatusError):
         knowledge.model_call("chat/completions", {})
@@ -489,6 +533,8 @@ def test_repair_questions_require_applicable_numbered_manual_steps(services, mon
     result = ask(turns, "怎么排查？")
     assert result["decision"] == "answer" and original in result["answer"]
     assert [row["sourceId"] for row in result["citations"]] == [source_id]
+    bare_code = ask(new_conversation("A01"), "Ｌ９２")
+    assert bare_code["decision"] == "answer" and original in bare_code["answer"]
     wrong_batch = ask(new_conversation("A02"), "L92 怎么排查？")
     assert wrong_batch["decision"] == "no_evidence" and not wrong_batch["citations"]
     only_definition = ask(new_conversation("A01"), "E07 怎么修复？")
@@ -582,4 +628,20 @@ def test_independent_import_formats(services, monkeypatch, suffix, category, bod
     if suffix == "pdf":
         safety = ask("How do I fix T74 while energized?")
         assert safety["decision"] == "safety" and expected not in safety["answer"]
+
+
+def test_completed_filter_applies_before_list_limit(services):
+    from maintenance.db import DB, add
+
+    client, _ = services
+    with DB.begin() as db:
+        closed = add(db, "demo", "draft", owner="tech", status="linked",
+                     device={"model": "IM-200", "batch": "A01"}, completedAt="2020-01-01T00:00:00Z")
+        closed.updated = "2020-01-01T00:00:00Z"
+        closed_id = closed.id
+        for _ in range(100):
+            add(db, "demo", "draft", owner="tech", status="linked",
+                device={"model": "IM-200", "batch": "A01"})
+    post(client, "/auth/demo", {"role": "library"})
+    assert closed_id in {row["id"] for row in get(client, "/completed")}
 
