@@ -20,6 +20,10 @@ const locked = computed(() => ['linked', 'submitting'].includes(draft.value?.sta
 const edited = computed(() => JSON.stringify(fields.value) !== JSON.stringify(draft.value?.fields || {}))
 const canExport = computed(() => ['confirmed','exported','linked'].includes(draft.value?.status || '') && !edited.value)
 const hasOperation = computed(() => store.workorderEnabled && !store.profile?.demo)
+function draftStatus(row: Row) {
+  if (row.completedAt) return '已结单'
+  return row.status === 'linked' ? '待确认结单' : statuses[row.status]
+}
 function update(row: Row, preserve = false) {
   draft.value = row
   if (!preserve) fields.value = { ...row.fields }
@@ -71,7 +75,7 @@ function download() { return modify(async () => {
 function register() { return modify(async () => {
   const current = draft.value!
   update(await api<Row>('/drafts/' + current.id + '/register', 'POST', { revision: current.revision, number: contractNumber.value }))
-  notice('外部单号已登记')
+  notice('外部单号已登记，实际结单后请确认')
 }) }
 function addFile(event: Event) {
   const input = event.target as HTMLInputElement
@@ -113,11 +117,11 @@ function markDone() { return modify(async () => {
     <p v-if="!draft && err" class="page-error" role="alert">{{ err }}</p>
     <section v-if="!route.params.id" class="card list-card">
       <div v-if="!rows.length" class="empty"><ClipboardList :size="34"/><b>{{ ready ? '还没有工单草稿' : '正在读取草稿…' }}</b><p v-if="ready">在问答中选择「生成工单草稿」即可开始填写。</p></div>
-      <RouterLink v-for="row in rows" :key="row.id" class="source-row" :to="'/drafts/' + row.id"><span class="tile-icon mint"><ClipboardList :size="21"/></span><span class="source-main"><b>{{ row.fields.symptom || row.device.name }}</b><small>{{ row.device.number }} · {{ date(row.updated, true) }}</small></span><span class="pill">{{ row.completedAt ? '已结单' : statuses[row.status] }}</span><ChevronRight :size="18"/></RouterLink>
+      <RouterLink v-for="row in rows" :key="row.id" class="source-row" :to="'/drafts/' + row.id"><span class="tile-icon mint"><ClipboardList :size="21"/></span><span class="source-main"><b>{{ row.fields.symptom || row.device.name }}</b><small>{{ row.device.number }} · {{ date(row.updated, true) }}</small></span><span class="pill">{{ draftStatus(row) }}</span><ChevronRight :size="18"/></RouterLink>
     </section>
     <div v-if="draft" class="edit-layout">
       <section class="card content-card form-stack">
-        <div class="section-head"><div><h2>现场记录</h2><p>{{ draft.device.name }} · {{ draft.device.number }}</p></div><span :class="['pill', { green: draft.status !== 'draft' }]">{{ draft.completedAt ? '已结单' : statuses[draft.status] }}</span></div>
+        <div class="section-head"><div><h2>现场记录</h2><p>{{ draft.device.name }} · {{ draft.device.number }}</p></div><span :class="['pill', { green: draft.completedAt || ['confirmed', 'exported'].includes(draft.status) }]">{{ draftStatus(draft) }}</span></div>
         <div class="device-facts"><div><small>设备型号 / 批次</small><b>{{ draft.device.model }} / {{ draft.device.batch || '未知' }}</b></div><div><small>设备位置</small><b>{{ draft.device.location || '未登记' }}</b></div></div>
         <label v-for="(label, key) in fieldNames" :key="key"><span class="field-label">{{ label }} <em v-if="key !== 'faultCode'">*</em><small v-if="draft.origins[key]">{{ draft.origins[key] }}</small></span><input v-if="key === 'faultCode'" v-model="fields[key]" maxlength="120" :disabled="locked" placeholder="如有，请核对后填写"/><textarea v-else v-model="fields[key]" :disabled="locked" rows="3" maxlength="8000" :placeholder="key === 'symptom' ? '描述现场故障' : '填写经现场确认的' + label"></textarea></label>
         <div class="attachments">
@@ -139,7 +143,10 @@ function markDone() { return modify(async () => {
           <button v-if="hasOperation && canExport && !locked" class="btn primary own-width" :disabled="busy" @click="submit">正式回写</button>
           <form v-if="draft.status === 'exported' && !edited" class="form-stack" @submit.prevent="register"><label>外部工单号<input v-model="contractNumber" required maxlength="64" placeholder="录入正式系统的单号"/></label><button class="btn primary own-width" :disabled="busy">登记外部单号</button></form>
           <p v-if="draft.externalNumber"><Check :size="17" class="inline-icon"/> {{ draft.externalNumber }}</p>
-          <button v-if="draft.status === 'linked' && !draft.completedAt" class="btn secondary own-width" :disabled="busy" @click="markDone">确认外部工单已结单</button>
+          <template v-if="draft.status === 'linked' && !draft.completedAt">
+            <p class="muted">外部工单实际结单后，请在这里确认。确认后，知识管理员可在案例回流中查看。</p>
+            <button class="btn primary own-width" :disabled="busy" @click="markDone">确认外部工单已结单</button>
+          </template>
           <div v-if="submission"><p class="muted">回写请求 {{ submission.requestId }} · {{ statuses[submission.status] || submission.status }}</p><button class="btn secondary own-width" :disabled="busy" @click="refresh">查询原请求</button></div>
         </section>
       </aside>

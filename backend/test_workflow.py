@@ -1,5 +1,6 @@
 import json
 import os
+from io import BytesIO
 from uuid import uuid4
 
 import pytest
@@ -148,8 +149,14 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     assert export["references"][0]["referenceUrl"] == info["referenceUrl"]
     draft = get(client, draft_url)
     draft = post(client, draft_url + "/register", {"revision": draft["revision"], "number": "CHECK-001"})
+    post(client, "/auth/demo", {"role": "library"})
+    assert all(row["id"] != draft["id"] for row in get(client, "/completed"))
+    post(client, "/auth/demo", {"role": "tech"})
     draft = post(client, draft_url + "/complete", {"revision": draft["revision"]})
     assert draft["completedAt"]
+    post(client, "/auth/demo", {"role": "library"})
+    assert any(row["id"] == draft["id"] for row in get(client, "/completed"))
+    post(client, "/auth/demo", {"role": "tech"})
     locked = client.post(f"/api/v1{draft_url}/attachments?revisionId={draft['revision']}",
                          files={"file": ("sample.pdf", b"%PDF-sample", "application/pdf")})
     assert locked.status_code == 409
@@ -441,4 +448,138 @@ def test_new_documents_can_be_approved_for_model_answers(services, monkeypatch):
     monkeypatch.setattr(conversations.cfg, "model_url", "https://replacement.example.invalid")
     assert ask("验收设备的观察窗口直径是多少？")["decision"] == "evidence"
     assert len(outbound) == 1
+
+
+def test_repair_questions_require_applicable_numbered_manual_steps(services, monkeypatch):
+    from maintenance import conversations
+
+    client, worker = services
+    original = ("L92 记录校验提示\n"
+                "适用条件：验收台处于记录核对状态。\n"
+                "排查步骤：\n1. 核对样本记录编号。\n2. 对照台账中的记录版本。")
+    for incomplete in (original.replace("2. 对照", "3. 对照"), original + "\n第 3 步："):
+        assert conversations.procedure_excerpt([{"position": "文本正文", "text": incomplete}], {}, {"L92"}) is None
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", False)
+    post(client, "/auth/demo", {"role": "library"})
+    info = dict(number="L92-PROCEDURE", version="1.0", title="记录核对验收手册",
+                model="IM-200", batch="A01", category="manual")
+    source_id = upload(client, info, original)["items"][0]["sourceId"]
+    do_job(worker, "parse")
+    action = f"/sources/{source_id}/actions"
+    source = get(client, f"/sources/{source_id}")
+    source = post(client, action, dict(action="review", revision=source["revision"], verified=True))
+    post(client, "/auth/demo", {"role": "expert"})
+    source = post(client, action, dict(action="approve", revision=source["revision"]))
+    post(client, "/auth/demo", {"role": "library"})
+    source = post(client, action, dict(action="publish", revision=source["revision"]))
+    post(client, "/auth/demo", {"role": "tech"})
+    devices = {row["batch"]: row["id"] for row in get(client, "/devices") if row["model"] == "IM-200"}
+
+    def new_conversation(batch):
+        session = post(client, "/sessions", {"deviceId": devices[batch]}, 201)
+        return f"/sessions/{session['id']}/turns"
+
+    def ask(url, text):
+        turn = post(client, url, {"clientMessageId": uuid4().hex, "text": text}, 202)
+        do_job(worker, "turn")
+        return get(client, f"{url}/{turn['id']}")
+
+    turns = new_conversation("A01")
+    ask(turns, "L92 提示是什么意思？")
+    result = ask(turns, "怎么排查？")
+    assert result["decision"] == "answer" and original in result["answer"]
+    assert [row["sourceId"] for row in result["citations"]] == [source_id]
+    wrong_batch = ask(new_conversation("A02"), "L92 怎么排查？")
+    assert wrong_batch["decision"] == "no_evidence" and not wrong_batch["citations"]
+    only_definition = ask(new_conversation("A01"), "E07 怎么修复？")
+    assert only_definition["decision"] == "evidence" and "不足以确认" in only_definition["answer"]
+    assert [row["number"] for row in only_definition["citations"]] == ["MAN-001"]
+    safety = ask(new_conversation("A01"), "L92 怎么带电拆卸处理？")
+    assert safety["decision"] == "safety" and original not in safety["answer"]
+
+    post(client, "/auth/demo", {"role": "library"})
+    post(client, action, dict(action="block", revision=source["revision"]))
+    post(client, "/auth/demo", {"role": "tech"})
+    expired = get(client, f"{turns}/{result['id']}")
+    assert expired["decision"] == "expired" and original not in expired["answer"]
+
+
+@pytest.mark.parametrize("suffix,category,body,question,expected,position", [
+    ("txt", "manual", "故障码：104\n适用条件：通过记录核对。\n解决办法：\n1. 核对样本登记名。\n2. 对照归档编号。",
+     "故障码 104 怎么处理？", "对照归档编号", "文本正文"),
+    ("md", "manual", "验收阶段仅核对记录。\n## F23\n处理步骤：\n1. 查验样本批号。\n\n## F24\n"
+     "处置步骤：\n1. 核对抄录日期。\n2. 核对封存编号。",
+     "Ｆ－２４怎么排查？", "核对封存编号", "文本正文"),
+    ("docx", "manual", "D63 记录校验提示\n故障排查\n第一步：核对登记名称。\n第二步：核对归档日期。",
+     "D63 的排查方法是什么？", "核对归档日期", "D63 记录校验提示"),
+    ("pdf", "manual", "Fault code: T74\nTroubleshooting\nStep 1: Check the sample label.\nStep 2: Compare the record number.",
+     "How do I troubleshoot T74?", "Compare the record number.", "第 1 页"),
+    ("csv", "case", "案例编号,现象,结果\nQA8,观察窗标签模糊,归档标记已经更正",
+     "观察窗标签模糊的案例处理结果是什么？", "归档标记已经更正", "记录 QA8"),
+])
+def test_independent_import_formats(services, monkeypatch, suffix, category, body, question, expected, position):
+    import pymupdf
+    from docx import Document
+    from maintenance import conversations
+
+    raw = body.encode("utf-8")
+    if suffix == "docx":
+        document = Document()
+        title, *lines = body.splitlines()
+        document.add_heading(title, level=1)
+        for line in lines:
+            document.add_paragraph(line)
+        stream = BytesIO()
+        document.save(stream)
+        raw = stream.getvalue()
+    elif suffix == "pdf":
+        with pymupdf.open() as document:
+            page = document.new_page()
+            for index, line in enumerate(body.splitlines()):
+                page.insert_text((55, 55 + 19 * index), line)
+            raw = document.tobytes()
+
+    client, worker = services
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", False)
+    post(client, "/auth/demo", {"role": "platform"})
+    model = f"FORMAT-{suffix.upper()}"
+    device = post(client, "/devices", {"number": model, "name": "独立验收设备", "model": model})
+    post(client, "/auth/demo", {"role": "library"})
+    metadata = dict(number=model, version="1.0", title="独立验收资料", model=model, category=category)
+    response = client.post("/api/v1/sources/import", data={"metadata": json.dumps([metadata])},
+                           files={"files": (f"sample.{suffix}", raw, "application/octet-stream")})
+    assert response.status_code == 202
+    source_id = response.json()["items"][0]["sourceId"]
+    do_job(worker, "parse")
+    path = f"/sources/{source_id}"
+    source = get(client, path)
+    source = post(client, path + "/actions", dict(action="review", revision=source["revision"], verified=True))
+    post(client, "/auth/demo", {"role": "expert"})
+    source = post(client, path + "/actions", dict(action="approve", revision=source["revision"]))
+    post(client, "/auth/demo", {"role": "library"})
+    post(client, path + "/actions", dict(action="publish", revision=source["revision"]))
+    post(client, "/auth/demo", {"role": "tech"})
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    path = f"/sessions/{session['id']}/turns"
+
+    def ask(text):
+        turn = post(client, path, {"clientMessageId": uuid4().hex, "text": text}, 202)
+        do_job(worker, "turn")
+        return get(client, f"{path}/{turn['id']}")
+
+    answer = ask(question)
+    citations = answer.get("citations", [])
+    wanted = "answer" if category == "manual" else "evidence"
+    assert answer["decision"] == wanted, answer["answer"]
+    assert [row["sourceId"] for row in citations] == [source_id]
+    assert citations[0]["position"] == position
+    assert expected in (answer["answer"] if category == "manual" else citations[0]["text"])
+    if suffix == "md":
+        assert "查验样本批号" not in answer["answer"] and "验收阶段仅核对记录。" in answer["answer"]
+        ask("F23 是什么提示？")
+        followup = ask("那怎么处理？")
+        assert "查验样本批号" in followup["answer"] and "核对封存编号" not in followup["answer"]
+    if suffix == "pdf":
+        safety = ask("How do I fix T74 while energized?")
+        assert safety["decision"] == "safety" and expected not in safety["answer"]
 

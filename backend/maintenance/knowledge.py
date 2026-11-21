@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from math import isfinite
 from pathlib import Path
 from time import sleep
+from unicodedata import normalize
 from urllib.parse import urlsplit
 from zipfile import ZipFile
 
@@ -22,7 +23,15 @@ from .db import Chunk, Record, Scope, cfg, current_scopes, digest, find, records
 
 KINDS = {"manual": "维修手册", "workorder": "历史工单", "case": "故障案例"}
 CODES = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{1,5}[-_]?\d{2,6}(?![A-Za-z0-9])")
-SAFETY = re.compile(r"停机|送电|断电|带电|拆卸|拆装|高压|旁路|短接|复位|急停|隔离电|安全联锁|重启|合闸")
+CODE_LABEL = r"故障代码|报警代码|告警代码|故障码|报警码|告警码|错误码|fault code|alarm code|error code"
+LABELLED_CODE = re.compile(
+    rf"(?:{CODE_LABEL})[ \t]*(?:[：:]|为)?[ \t]*((?:[A-Za-z]{{1,5}}[-_]?)?\d{{1,6}})(?![A-Za-z0-9./-])", re.I
+)
+SAFETY = re.compile(
+    r"停机|送电|断电|带电|拆卸|拆装|高压|旁路|短接|复位|急停|隔离电|安全联锁|重启|合闸"
+    r"|\b(?:energized|energised|live circuit|high voltage|lockout|bypass|short[- ]circuit|disassembl\w*|"
+    r"emergency stop|reset|restart|shut\s*down|power (?:off|on)|safety interlock)\b", re.I
+)
 MODEL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
@@ -245,7 +254,8 @@ def terms(value):
 
 
 def codes_in(value):
-    return {m.upper() for m in CODES.findall(value)}
+    value = normalize("NFKC", value).translate(str.maketrans("–—−", "---"))
+    return {match.upper() for pattern in (CODES, LABELLED_CODE) for match in pattern.findall(value)}
 
 
 def code_key(code):

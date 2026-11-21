@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .common import actor, device_for, fail, get_db, need, own, role
 from .db import Record, add, audit, cfg, enqueue, find, records
-from .knowledge import (SAFETY, applicability, authorized_citation, code_key, codes_in, fault_codes,
+from .knowledge import (CODE_LABEL, SAFETY, applicability, authorized_citation, code_key, codes_in, fault_codes,
                         model_call, model_evidence, retrieve)
 
 router = APIRouter()
@@ -147,6 +147,62 @@ def redact(value):
 _SENTENCE_BREAK = re.compile(r"(?<=[。！？!?])|(?<=\.)\s+(?=[A-Z])|\n+")
 _WORKORDER_QUESTION = re.compile(r"历史工单|历史记录|过往工单|类似工单|演示工单|工单里|工单记录")
 _CASE_QUESTION = re.compile(r"事故|案例|复盘|通报")
+_PROCEDURE_QUESTION = re.compile(
+    r"(?:怎么|如何|怎样)(?:进行)?(?:修|维修|排除|排障|处理|处置|解决|排查)"
+    r"|(?:维修|修复|排障|处理|处置|排查)(?:步骤|方法|流程)"
+    r"|\bhow\b[^?\n]{0,70}\b(?:repair|fix|troubleshoot|resolve)\b"
+    r"|\b(?:repair|troubleshooting|corrective) (?:steps|procedure)\b", re.I
+)
+_PROCEDURE_HEADING = re.compile(
+    r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:故障(?:排查|处理|处置)"
+    r"|(?:维修|修复|处理|处置|检查|排查|排除|解决)(?:步骤|方法|流程|办法)"
+    r"|troubleshooting(?: steps)?|corrective actions?|remedy)[：:]?[ \t]*$"
+)
+_PROCEDURE_STEP = re.compile(
+    r"(?im)^[ \t]*(?:(?:(?:步骤|step\b)[ \t]*(\d{1,3})"
+    r"|第[ \t]*(\d{1,3}|[一二三四五六七八九十])[ \t]*步)[ \t]*[：:、.．）)]?"
+    r"|[(（]?(\d{1,3})[、.．）)](?!\d))[ \t]*([^\r\n]*)"
+)
+_FAULT_SECTION = re.compile(
+    rf"(?im)^[ \t]*(?:(?:#{{1,6}}[ \t]+)?(?:{CODE_LABEL})[ \t]*[：:]?[ \t]*"
+    r"(?:[A-Z]{1,5}[-_]?)?\d{1,6}|#{1,6}[ \t]+[A-Z]{1,5}[-_]?\d{1,6})"
+    r"(?![A-Za-z0-9./-])[^\r\n]*"
+)
+_CHINESE_STEP = dict(zip("一二三四五六七八九十", range(1, 11)))
+
+
+def applicable_procedure_text(item, device, requested):
+    body = item["text"].strip()
+    sections = list(_FAULT_SECTION.finditer(body))
+    if not sections:
+        context = item["position"] + "\n" + body
+        return body if {code_key(code) for code in fault_codes(context, device)} == requested else ""
+    excerpts = []
+    preamble = body[:sections[0].start()]
+    for index, section in enumerate(sections):
+        if {code_key(code) for code in fault_codes(section.group(), device)} == requested:
+            end = sections[index + 1].start() if index + 1 < len(sections) else len(body)
+            excerpts.append((preamble + body[section.start():end]).strip())
+    return excerpts[0] if len(excerpts) == 1 else ""
+
+
+def procedure_excerpt(manuals, device, requested):
+    if len(requested) != 1:
+        return None
+    available = []
+    for item in manuals:
+        text = applicable_procedure_text(item, device, requested)
+        headings = list(_PROCEDURE_HEADING.finditer(text))
+        if len(headings) != 1 or len(text) > 1600 or re.search(r"续上|续下|续表|接上页|见下页|见下一页|转下页", text):
+            continue
+        entries = _PROCEDURE_STEP.findall(text[headings[0].end():])
+        if any(not instruction.strip() for *_, instruction in entries):
+            continue
+        numbers = [first or second or third for first, second, third, _ in entries]
+        steps = [_CHINESE_STEP[number] if number in _CHINESE_STEP else int(number) for number in numbers]
+        if steps and steps == list(range(1, len(steps) + 1)):
+            available.append((item, text))
+    return available[0] if len(available) == 1 else None
 
 
 def grounded_answer(query, evidence, primary="manual"):
@@ -196,12 +252,19 @@ def answer_turn(db, org, turn):
     text = turn.data["text"]
     earlier = [row.data["text"] for row in session_turns(db, org, session)
                if row.data["sequence"] < turn.data["sequence"]][-3:]
-    query = " ".join([*earlier, text]) if len(text) <= 32 and earlier and not fault_codes(text, device) else text
+    query = text
+    if len(text) <= 60 and earlier and not fault_codes(text, device):
+        for index in range(len(earlier) - 1, -1, -1):
+            if fault_codes(earlier[index], device):
+                earlier = earlier[index:]
+                break
+        query = " ".join([*earlier, text])
     candidates, ambiguous = retrieve(db, org, device, query)
+    wants_procedure = bool(_PROCEDURE_QUESTION.search(text))
     primary = "manual"
-    if _WORKORDER_QUESTION.search(text):
+    if not wants_procedure and _WORKORDER_QUESTION.search(text):
         primary = "workorder"
-    elif _CASE_QUESTION.search(text):
+    elif not wants_procedure and _CASE_QUESTION.search(text):
         primary = "case"
     data = dict(decision="clarify", referenceIds=[], answer="")
     if ambiguous:
@@ -211,7 +274,9 @@ def answer_turn(db, org, turn):
     elif len(text) < 6 and not fault_codes(query, device) and not earlier:
         data["answer"] = "请描述面板上的故障码、异常现象，以及异常发生时的运行状态。"
     elif not candidates:
-        data.update(decision="no_evidence", answer="当前设备范围内没有匹配的已发布资料。可以补充故障码和发生条件，或转交班组专家。")
+        answer = ("当前没有找到适用的维修步骤。请核对设备型号、完整故障码和发生条件，或转交班组专家。"
+                  if wants_procedure else "当前设备范围内没有匹配的已发布资料。可以补充故障码和发生条件，或转交班组专家。")
+        data.update(decision="no_evidence", answer=answer)
     else:
         data["referenceIds"] = [item["id"] for item in candidates]
         manual = [item for item in candidates if item["category"] == "manual"]
@@ -226,6 +291,19 @@ def answer_turn(db, org, turn):
             data.update(decision="safety", answer="这涉及安全关键操作。请核对下方适用的审核原文和图示，并按现场规程由有权限的人员处置。")
             if not manual:
                 data["answer"] = "缺少适用的已审核手册。请将问题转交班组专家核实。"
+        elif wants_procedure:
+            excerpt = procedure_excerpt(matched, device, requested)
+            if excerpt:
+                citation, original = excerpt
+                data.update(decision="answer", referenceIds=[citation["id"]],
+                            answer=f"已审核的手册处置原文 [1]\n\n{original}\n\n"
+                                   "请按出处核对完整章节、适用条件和现场规程。")
+            elif manual:
+                data.update(decision="evidence", referenceIds=[item["id"] for item in manual],
+                            answer="找到了相关手册，但当前片段不足以确认可用的维修步骤。下方资料可供核对。请补充适用的维修手册，或转交班组专家。")
+            else:
+                data.update(decision="no_evidence", referenceIds=[],
+                            answer="当前没有找到适用的已审核维修步骤。请转交班组专家核实。")
         else:
             condition = f"适用设备：{device['model']}" + (f" · 批次 {device['batch']}" if device.get("batch") else "")
             if primary != "manual":

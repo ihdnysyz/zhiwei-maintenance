@@ -12,15 +12,25 @@ const note = ref('')
 const assignee = ref('')
 const error = ref('')
 const busy = ref(false)
+const caseLoading = ref(false)
+const caseError = ref('')
 const expert = computed(() => store.profile?.role === 'expert')
 const manage = computed(() => expert.value || store.profile?.role === 'library')
 async function load() {
   try {
     tasks.value = await api<Row[]>('/tasks')
-    if (manage.value) completed.value = await api<Row[]>('/completed')
   } catch (e) { notice(errorMessage(e), true) }
 }
 onMounted(load)
+async function openCases() {
+  tab.value = 'cases'
+  if (caseLoading.value) return
+  caseLoading.value = true
+  caseError.value = ''
+  try { completed.value = await api<Row[]>('/completed') }
+  catch (e) { caseError.value = errorMessage(e) }
+  finally { caseLoading.value = false }
+}
 async function open(row: Row) {
   note.value = ''; assignee.value = ''; error.value = ''
   try { selected.value = await api<Row>('/tasks/' + row.id) }
@@ -64,14 +74,16 @@ async function sendCase() {
   <main class="page">
     <div class="page-heading"><div><h1>专家协作</h1><p>请班组专家核实疑难问题，并把已结单经验整理入库。</p></div><RouterLink class="btn secondary" to="/ask">返回诊断 <ArrowUpRight :size="17"/></RouterLink></div>
     <section class="card list-card">
-      <div v-if="manage" class="filters"><div class="tabs"><button :class="{ on: tab === 'tasks' }" @click="tab = 'tasks'">专家待办</button><button :class="{ on: tab === 'cases' }" @click="tab = 'cases'">案例回流</button></div></div>
+      <div v-if="manage" class="filters"><div class="tabs"><button :class="{ on: tab === 'tasks' }" @click="tab = 'tasks'">专家待办</button><button :class="{ on: tab === 'cases' }" @click="openCases">案例回流</button></div></div>
       <template v-if="tab === 'tasks'">
         <div v-if="!tasks.length" class="empty"><Users :size="34"/><b>暂无专家待办</b><p>在问答中选择「转交专家」，就能在这里跟进。</p></div>
         <button v-for="row in tasks" :key="row.id" class="source-row" @click="open(row)"><span class="tile-icon mint"><MessageSquare :size="20"/></span><span class="source-main"><b>{{ row.title }}</b><small>{{ row.deviceName }} · {{ date(row.updated, true) }}</small></span><span v-if="row.overdue" class="pill">已逾期</span><span class="pill">{{ statuses[row.status] }}</span><ChevronRight :size="17"/></button>
       </template>
       <template v-else>
-        <div v-if="!completed.length" class="empty"><ClipboardCheck :size="34"/><b>暂无可回流的已结单记录</b><p>现场经办人登记外部工单并确认结单后，记录会出现在这里。</p></div>
-        <button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">整理案例</span><ChevronRight :size="17"/></button>
+        <div v-if="caseLoading" class="empty" role="status">正在读取已结单记录…</div>
+        <div v-else-if="caseError" class="empty"><p class="error" role="alert">{{ caseError }}</p><button class="btn secondary" @click="openCases">重新读取</button></div>
+        <div v-else-if="!completed.length" class="empty"><ClipboardCheck :size="34"/><b>暂无可回流的已结单记录</b><p>请由维修人员在工单详情点击「确认外部工单已结单」。</p></div>
+        <template v-else><button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">整理案例</span><ChevronRight :size="17"/></button></template>
       </template>
     </section>
     <div v-if="selected || record" class="backdrop" @click="selected = null; record = null"></div>
