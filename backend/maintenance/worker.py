@@ -153,9 +153,11 @@ def run(job):
                     for (position, body, ocr), vector in zip(document, vectors):
                         db.add(Chunk(org=job.org, source=row.id, position=position, body=body, ocr=ocr,
                                      embedding=vector, embedding_model=cfg.embedding_model if vector is not None else ""))
-                    row.change("calibration", indexReady=True, chunkCount=len(document),
+                    case_review = row.data.get("category") == "case" and bool(row.data.get("workorderLocator"))
+                    row.change("review" if case_review else "calibration", indexReady=True, chunkCount=len(document),
                                ocr=any(item[2] for item in document), keywordOnly=degraded)
-                    audit(db, job.org, "worker", "资料解析完成，等待校核", row.id, job.id)
+                    label = "案例校验完成，已送独立审核" if case_review else "资料解析完成，等待校核"
+                    audit(db, job.org, "worker", label, row.id, job.id)
             elif job.kind == "turn":
                 row = find(db, job.org, "turn", id=job.target)
                 session = find(db, job.org, "session", id=row.owner, lock=True) if row else None

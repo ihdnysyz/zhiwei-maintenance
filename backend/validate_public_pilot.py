@@ -270,7 +270,8 @@ def exercise(live_model, corpus):
         request(client, "POST", path + "/confirm", 422, json={"revision": draft["revision"]})
         fields = {"cause": "验收录入", "actions": "验收录入", "result": "验收录入"}
         draft = request(client, "PATCH", path, json={"fields": fields, "revision": draft["revision"]}).json()
-        confirmed = request(client, "POST", path + "/confirm", json={"revision": draft["revision"]}).json()
+        confirmed = request(client, "POST", path + "/confirm",
+                            json={"revision": draft["revision"], "number": "PILOT-CHECK-001"}).json()
         exported = request(client, "POST", path + "/export", json={"revision": confirmed["revision"]}).json()
         assert exported["references"][0]["referenceUrl"] == citation["referenceUrl"]
         login(client, "library")

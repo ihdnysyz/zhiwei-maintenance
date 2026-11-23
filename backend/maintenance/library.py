@@ -18,6 +18,11 @@ from .knowledge import KINDS, applicability, authorized_citation, embeddings, mo
 router = APIRouter()
 CONTENT_TYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                  "txt": "text/plain; charset=utf-8", "md": "text/plain; charset=utf-8", "csv": "text/plain; charset=utf-8"}
+WORKORDER_CASE_VERSION = "1.0"
+
+
+def workorder_case_number(draft_id):
+    return f"CASE-{draft_id[:12]}"
 
 
 class ImportInfo(BaseModel):

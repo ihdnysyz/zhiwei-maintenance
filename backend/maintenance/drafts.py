@@ -7,12 +7,13 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy.exc import IntegrityError
 
-from .common import actor, device_for, fail, get_db, need, own, revision
+from .common import actor, device_for, fail, get_db, need, own, permitted_device, revision
 from .conversations import active_session, session_turns, turn_view
 from .db import Record, add, audit, audit_events, cfg, digest, enqueue, find, now, records, uid
-from .knowledge import fault_codes
-from .library import file_response
+from .knowledge import applicability, fault_codes
+from .library import WORKORDER_CASE_VERSION, file_response, workorder_case_number
 
 router = APIRouter()
 FIELDS = {"symptom": "故障现象", "faultCode": "故障码", "cause": "已确认原因",
@@ -31,6 +32,7 @@ class DraftPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int
     fields: dict[Literal["symptom", "faultCode", "cause", "actions", "result"], str]
+    number: str | None = Field(default=None, max_length=64)
 
     @field_validator("fields")
     @classmethod
@@ -49,8 +51,46 @@ class Register(Revision):
     number: str = Field(min_length=3, max_length=64)
 
 
+class Confirm(Revision):
+    number: str | None = Field(default=None, max_length=64)
+
+
+def ticket_number(value):
+    number = value.strip()
+    if not re.fullmatch(cfg.allowed_ticket_pattern, number):
+        fail(422, "INVALID_TICKET", "外部工单编号格式不正确")
+    return number
+
+
+def link_ticket(db, row, number):
+    key = number.upper()
+    if find(db, row.org, "ticket", key=key):
+        fail(409, "DUPLICATE_TICKET", "该外部单号已登记")
+    try:
+        with db.begin_nested():
+            add(db, row.org, "ticket", key=key, owner=row.id)
+            db.flush()
+    except IntegrityError:
+        if not find(db, row.org, "ticket", key=key):
+            raise
+        fail(409, "DUPLICATE_TICKET", "该外部单号已登记")
+
+
 def attachments(db, org, draft_id):
     return list(db.scalars(records(org, "attachment").where(Record.owner == draft_id).order_by(Record.created)))
+
+
+def case_progress(db, user, draft):
+    if not draft.data.get("completedAt") or not permitted_device(user, draft.data["device"]):
+        return None
+    number = workorder_case_number(draft.id)
+    case = find(db, user.org, "source", key=f"{number}:{WORKORDER_CASE_VERSION}")
+    if (not case or case.data.get("category") != "case" or not permitted_device(user, case.data)
+            or case.data.get("workorderLocator") != draft.data.get("externalNumber")):
+        return {"status": "not_submitted"}
+    device = find(db, user.org, "device", id=draft.data["device"]["id"])
+    applicable, _ = applicability(db, user.org, device.data) if device and permitted_device(user, device.data) else ({}, False)
+    return {"status": case.status, "sourceId": case.id if case.id in applicable else None}
 
 
 def view(db, user, row):
@@ -63,7 +103,7 @@ def view(db, user, row):
     submission = find(db, user.org, "submission", key=row.id) if row.status in {"submitting", "linked"} else None
     targets = [row.id, submission.id] if submission else [row.id]
     return {**row.view("snapshot"), "references": ref, "sessionAvailable": bool(session and session.status != "deleted"),
-            "operationHistory": audit_events(db, user.org, targets),
+            "operationHistory": audit_events(db, user.org, targets), "caseProgress": case_progress(db, user, row),
             "attachments": [item.view() for item in attachments(db, user.org, row.id)]}
 
 
@@ -117,8 +157,15 @@ def patch_draft(draft_id: str, body: DraftPatch, request: Request, user=Depends(
         if old[key] != value:
             changes.append(dict(field=key, before=old[key], after=value, actor=user.key, at=now(), revision=row.rev + 1))
             origins[key] = "经办人填写"
-    if len(changes) != len(row.data["changes"]):
-        row.change("draft", fields={**old, **body.fields}, origins=origins, changes=changes, snapshot=None)
+    pending = row.data.get("pendingExternalNumber", "") if body.number is None else body.number.strip()
+    number_changed = pending != row.data.get("pendingExternalNumber", "")
+    fields_changed = len(changes) != len(row.data["changes"])
+    if fields_changed:
+        row.change("draft", fields={**old, **body.fields}, origins=origins, changes=changes, snapshot=None,
+                   pendingExternalNumber=pending)
+    elif number_changed:
+        row.change(pendingExternalNumber=pending)
+    if fields_changed or number_changed:
         audit(db, user.org, user, "编辑工单草稿", row.id, request.state.request_id)
     return view(db, user, row)
 
@@ -185,16 +232,30 @@ def remove_attachment(draft_id: str, attachment_id: str, revisionId: int, reques
 
 
 @router.post("/drafts/{draft_id}/confirm")
-def confirm(draft_id: str, body: Revision, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+def confirm(draft_id: str, body: Confirm, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     row = own(db, user, "draft", draft_id, lock=True)
+    supplied = body.number if body.number is not None else row.data.get("pendingExternalNumber", "")
+    if row.status == "linked" and supplied.strip().upper() == row.data.get("externalNumber", "").upper():
+        device_for(db, user, row.data["device"]["id"])
+        return view(db, user, row)
     revision(row, body.revision)
     mutable(row)
-    if row.status in {"confirmed", "exported"}:
+    legacy = row.status in {"confirmed", "exported"}
+    if legacy and not supplied.strip():
         return view(db, user, row)
     device = device_for(db, user, row.data["device"]["id"])
     missing = [FIELDS[key] for key in REQUIRED if not row.data["fields"][key].strip()]
     if missing:
         fail(422, "REQUIRED_FIELDS", "请填写：" + "、".join(missing))
+    number = ticket_number(supplied) if supplied.strip() else ""
+    if not number and not (cfg.workorder_enabled and cfg.workorder_url and not user.data.get("demo")):
+        fail(422, "TICKET_REQUIRED", "请先填写外部工单号再确认")
+    if number:
+        link_ticket(db, row, number)
+    if legacy:
+        row.change("linked", externalNumber=number, pendingExternalNumber="")
+        audit(db, user.org, user, "登记外部工单号", row.id, request.state.request_id)
+        return view(db, user, row)
     references = view(db, user, row)["references"]
     snapshot = dict(draftId=row.id, confirmedAt=now(), confirmedBy=user.key, version=row.rev + 1,
                     device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
@@ -202,8 +263,11 @@ def confirm(draft_id: str, body: Revision, request: Request, user=Depends(actor)
                     references=[{key: ref[key] for key in ("sourceId", "number", "version", "position", "id", "referenceUrl")
                                  if ref.get(key) is not None} for ref in references],
                     attachments=[item.view() for item in attachments(db, user.org, row.id)])
-    row.change("confirmed", snapshot=snapshot)
+    row.change("linked" if number else "confirmed", snapshot=snapshot, pendingExternalNumber="",
+               **({"externalNumber": number} if number else {}))
     audit(db, user.org, user, "确认工单快照", row.id, request.state.request_id)
+    if number:
+        audit(db, user.org, user, "登记外部工单号", row.id, request.state.request_id)
     return view(db, user, row)
 
 
@@ -217,6 +281,8 @@ def export(draft_id: str, body: Revision, request: Request, user=Depends(actor),
     if row.status == "confirmed":
         row.change("exported")
     snapshot = {**row.data["snapshot"]}
+    if row.data.get("externalNumber"):
+        snapshot["externalNumber"] = row.data["externalNumber"]
     current = {ref["id"] for ref in view(db, user, row)["references"]}
     snapshot["references"] = [ref for ref in snapshot["references"] if ref["id"] in current]
     audit(db, user.org, user, "导出工单", row.id, request.state.request_id)
@@ -229,15 +295,11 @@ def register(draft_id: str, body: Register, request: Request, user=Depends(actor
     row = own(db, user, "draft", draft_id, lock=True)
     revision(row, body.revision)
     device_for(db, user, row.data["device"]["id"])
-    if row.status != "exported":
-        fail(409, "EXPORT_REQUIRED", "请先导出已确认的工单")
-    number = body.number.strip()
-    if not re.fullmatch(cfg.allowed_ticket_pattern, number):
-        fail(422, "INVALID_TICKET", "外部工单编号格式不正确")
-    if find(db, user.org, "ticket", key=number.upper()):
-        fail(409, "DUPLICATE_TICKET", "该外部单号已登记")
-    add(db, user.org, "ticket", key=number.upper(), owner=row.id)
-    row.change("linked", externalNumber=number)
+    if row.status not in {"confirmed", "exported"}:
+        fail(409, "CONFIRM_REQUIRED", "请先确认工单")
+    number = ticket_number(body.number)
+    link_ticket(db, row, number)
+    row.change("linked", externalNumber=number, pendingExternalNumber="")
     audit(db, user.org, user, "登记外部工单号", row.id, request.state.request_id)
     return view(db, user, row)
 
@@ -251,7 +313,7 @@ def submit(draft_id: str, body: Revision, request: Request, user=Depends(actor),
         return existing.view("payload")
     revision(row, body.revision)
     if not cfg.workorder_enabled or not cfg.workorder_url or user.data.get("demo"):
-        fail(409, "GATE_CLOSED", "正式工单回写尚未通过准入，请使用导出及外部单号登记")
+        fail(409, "GATE_CLOSED", "正式工单回写尚未启用，请登记外部工单号")
     if row.status not in {"confirmed", "exported"}:
         fail(409, "CONFIRM_REQUIRED", "请先确认工单")
     snapshot = {**row.data["snapshot"]}

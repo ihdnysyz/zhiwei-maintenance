@@ -162,19 +162,30 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     assert response.status_code == 200, response.text
     draft = response.json()
     assert draft["origins"]["cause"] == "经办人填写"
-    draft = post(client, draft_url + "/confirm", {"revision": draft["revision"]})
-    assert draft["status"] == "confirmed"
+    assert post(client, draft_url + "/confirm", {"revision": draft["revision"]}, 422)["code"] == "TICKET_REQUIRED"
+    response = client.patch("/api/v1" + draft_url, json={
+        "revision": draft["revision"], "fields": {}, "number": " CHECK-001 ",
+    })
+    assert response.status_code == 200
+    draft = response.json()
+    assert get(client, draft_url)["pendingExternalNumber"] == "CHECK-001"
+    confirmation = {"revision": draft["revision"], "number": "CHECK-001"}
+    draft = post(client, draft_url + "/confirm", confirmation)
+    assert draft["status"] == "linked" and draft["externalNumber"] == "CHECK-001"
+    assert post(client, draft_url + "/confirm", confirmation)["revision"] == draft["revision"]
     post(client, draft_url + "/submit", {"revision": draft["revision"]}, 409)
-    export = post(client, draft_url + "/export", {"revision": draft["revision"]})
-    assert export["fields"]["result"] == fields["result"]
-    assert export["references"][0]["referenceUrl"] == info["referenceUrl"]
-    draft = get(client, draft_url)
-    draft = post(client, draft_url + "/register", {"revision": draft["revision"], "number": "CHECK-001"})
     post(client, "/auth/demo", {"role": "library"})
     assert all(row["id"] != draft["id"] for row in get(client, "/completed"))
     post(client, "/auth/demo", {"role": "tech"})
     draft = post(client, draft_url + "/complete", {"revision": draft["revision"]})
     assert draft["completedAt"]
+    assert draft["caseProgress"] == {"status": "not_submitted"}
+    assert all(event["action"] != "导出工单" for event in draft["operationHistory"])
+    export = post(client, draft_url + "/export", {"revision": draft["revision"]})
+    assert export["externalNumber"] == "CHECK-001"
+    assert export["fields"]["result"] == fields["result"]
+    assert export["references"][0]["referenceUrl"] == info["referenceUrl"]
+    assert get(client, draft_url)["completedAt"] == draft["completedAt"]
     post(client, "/auth/demo", {"role": "library"})
     assert any(row["id"] == draft["id"] for row in get(client, "/completed"))
     post(client, "/auth/demo", {"role": "tech"})
@@ -199,13 +210,14 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     do_job(worker, "parse")
     case = get(client, f"/sources/{case['id']}")
     assert "13812345678" not in case["chunks"][0]["text"]
-    assert get(client, "/completed")[0]["caseSource"] == dict(id=case["id"], status="calibration", active=False)
+    assert get(client, "/completed")[0]["caseSource"] == dict(id=case["id"], status="review", active=False)
+    assert any(event["action"] == "案例校验完成，已送独立审核" and event["actor"] == "worker"
+               for event in case["operationHistory"])
     post(client, "/auth/demo", {"role": "tech"})
     search_url = f"/knowledge/search?deviceId={first['id']}&q=K81"
     assert all(row["sourceId"] != case["id"] for row in get(client, search_url))
-    post(client, "/auth/demo", {"role": "library"})
+    assert get(client, draft_url)["caseProgress"] == {"status": "review", "sourceId": None}
     case_url = f"/sources/{case['id']}/actions"
-    case = post(client, case_url, dict(action="review", revision=case["revision"], verified=True))
     post(client, "/auth/demo", {"role": "expert"})
     case = post(client, case_url, dict(action="reject", revision=case["revision"], note="补充验收记录"))
     assert case["status"] == "returned"
@@ -230,6 +242,16 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     assert [row["sourceId"] for row in get(client, f"{case_turns}/{case_turn['id']}")["citations"]] == [case["id"]]
     preserved = get(client, draft_url)
     assert preserved["sessionAvailable"]
+    assert preserved["caseProgress"] == {"status": "published", "sourceId": case["id"]}
+    visible_case = next(row for row in get(client, "/sources") if row["id"] == case["id"])
+    assert visible_case["category"] == "case"
+    duplicate_draft = post(client, "/drafts", {"sessionId": case_session["id"]}, 201)
+    duplicate_url = f"/drafts/{duplicate_draft['id']}"
+    edited_duplicate = client.patch("/api/v1" + duplicate_url,
+                                    json={"revision": duplicate_draft["revision"], "fields": fields}).json()
+    assert post(client, duplicate_url + "/confirm",
+                {"revision": edited_duplicate["revision"], "number": "check-001"}, 409)["code"] == "DUPLICATE_TICKET"
+    assert get(client, duplicate_url)["status"] == "draft"
     assert any(event["action"] == "确认外部结单" and event["actor"] == "tech"
                for event in preserved["operationHistory"])
     other = post(client, "/sessions", {"deviceId": first["id"]}, 201)

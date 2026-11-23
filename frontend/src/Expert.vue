@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ArrowUpRight, BookOpen, ChevronRight, ClipboardCheck, MessageSquare, Users, X } from 'lucide-vue-next'
-import { useRouter } from 'vue-router'
 import OperationHistory from './OperationHistory.vue'
+import SourceDetail from './SourceDetail.vue'
 import { api, date, errorMessage, notice, statuses, store, type Row } from './store'
 
 const tasks = ref<Row[]>([])
-const router = useRouter()
 const completed = ref<Row[]>([])
 const selected = ref<Row | null>(null)
 const record = ref<Row | null>(null)
+const caseSourceId = ref<string | null>(null)
 const tab = ref('tasks')
 const note = ref('')
 const assignee = ref('')
@@ -53,7 +53,7 @@ async function open(row: Row) {
 }
 function openCase(row: Row) {
   if (row.caseSource) {
-    void router.push({ path: '/library', query: { source: row.caseSource.id } })
+    caseSourceId.value = row.caseSource.id
     return
   }
   record.value = row
@@ -84,7 +84,7 @@ async function sendCase() {
   try {
     await api('/drafts/' + record.value.id + '/case', 'POST', { text: note.value })
     record.value = null; note.value = ''
-    notice('案例已送校核，审核通过后会自动发布')
+    notice('校验完成后将自动进入独立审核')
     await openCases()
   } catch (e) { error.value = errorMessage(e) }
   finally { busy.value = false }
@@ -106,7 +106,8 @@ async function sendCase() {
         <template v-else><button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">{{ row.caseSource ? (row.caseSource.active ? '案例已生效' : '案例 · ' + (row.caseSource.status === 'published' ? '未生效' : statuses[row.caseSource.status])) : '整理案例' }}</span><ChevronRight :size="17"/></button></template>
       </template>
     </section>
-    <div v-if="selected || record" class="backdrop" @click="selected = null; record = null"></div>
+    <div v-if="selected || record || caseSourceId" class="backdrop" @click="selected = null; record = null; caseSourceId = null"></div>
+    <SourceDetail v-if="caseSourceId" :key="caseSourceId" :source-id="caseSourceId" @close="caseSourceId = null" @updated="loadCases"/>
     <dialog v-if="selected" open class="sheet" aria-label="专家待办">
       <div class="sheet-head"><div><p class="eyebrow">{{ selected.deviceName }} · {{ statuses[selected.status] }}</p><h2>{{ selected.title }}</h2></div><button class="icon-btn" aria-label="关闭待办" @click="selected = null"><X :size="22"/></button></div>
       <div class="sheet-body form-stack">
@@ -127,7 +128,7 @@ async function sendCase() {
     </dialog>
     <dialog v-if="record" open class="modal" aria-label="整理回流案例">
       <div class="sheet-head"><div><p class="eyebrow">{{ record.externalNumber }}</p><h2>整理回流案例</h2></div><button class="icon-btn" aria-label="取消" @click="record = null"><X :size="22"/></button></div>
-      <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校核</button></div><OperationHistory :events="record.operationHistory"/></form>
+      <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。校验完成后将自动送审。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校验</button></div><OperationHistory :events="record.operationHistory"/></form>
     </dialog>
   </main>
 </template>

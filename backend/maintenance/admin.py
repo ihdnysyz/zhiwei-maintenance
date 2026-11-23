@@ -10,7 +10,7 @@ from sqlalchemy import select
 from .common import actor, fail, get_db, need, permitted_device, revision, role
 from .conversations import redact, turn_view
 from .db import Job, Record, Scope, add, audit, audit_events, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
-from .library import queue_source
+from .library import WORKORDER_CASE_VERSION, queue_source, workorder_case_number
 from .knowledge import model_call
 from .worker import external_headers
 
@@ -182,15 +182,15 @@ def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(acto
     device = row.data["device"]
     if row.status != "linked" or not row.data.get("completedAt") or not permitted_device(user, device):
         fail(409, "CASE_NOT_ELIGIBLE", "需要已登记工单及相应设备权限")
-    number = f"CASE-{row.id[:12]}"
+    number = workorder_case_number(row.id)
     text = redact(body.text).encode()
-    existing = find(db, user.org, "source", key=f"{number}:1.0")
+    existing = find(db, user.org, "source", key=f"{number}:{WORKORDER_CASE_VERSION}")
     if existing:
         if (existing.data.get("category") == "case" and permitted_device(user, existing.data)
                 and existing.data.get("workorderLocator") == row.data["externalNumber"] and existing.blob == text):
             return existing.view("digest", "approvedModelEndpoint")
         fail(409, "CASE_ALREADY_SUBMITTED", "该工单已有案例，请在案例回流中打开原记录继续维护")
-    info = dict(number=number, version="1.0", title=f"{device['model']} 已结单经验案例",
+    info = dict(number=number, version=WORKORDER_CASE_VERSION, title=f"{device['model']} 已结单经验案例",
                 model=device["model"], batch=device["batch"], category="case")
     case, _ = queue_source(db, user.org, user.key, info, "脱敏案例.txt", text)
     case.change(workorderLocator=row.data["externalNumber"])
@@ -208,7 +208,7 @@ def completed(user=Depends(actor), db=Depends(get_db, scope="function")):
     if models:
         eligible = eligible.where(Record.data["device"]["model"].as_string().in_(models))
     drafts = list(db.scalars(eligible.order_by(Record.updated.desc()).limit(100)))
-    keys = {row.id: f"CASE-{row.id[:12]}:1.0" for row in drafts}
+    keys = {row.id: f"{workorder_case_number(row.id)}:{WORKORDER_CASE_VERSION}" for row in drafts}
     sources = {row.key: row for row in db.scalars(records(user.org, "source").where(Record.key.in_(keys.values())))
                if permitted_device(user, row.data)}
     active = {row.source for row in db.scalars(current_scopes(user.org).where(
