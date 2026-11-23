@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ArrowUpRight, BookOpen, ChevronRight, ClipboardCheck, MessageSquare, Users, X } from 'lucide-vue-next'
 import { useRouter } from 'vue-router'
+import OperationHistory from './OperationHistory.vue'
 import { api, date, errorMessage, notice, statuses, store, type Row } from './store'
 
 const tasks = ref<Row[]>([])
@@ -121,11 +122,12 @@ async function sendCase() {
           <div class="button-row"><button v-if="['assigned','answered'].includes(selected.status)" class="btn primary" :disabled="busy || !note.trim()" @click="action('reply')">保存答复</button><button v-if="selected.status === 'answered'" class="btn secondary" :disabled="busy" @click="action('close')">关闭待办</button><button v-if="['answered','closed'].includes(selected.status) && !selected.revisionCandidate" class="btn secondary" :disabled="busy || !note.trim()" @click="action('revise')">提交知识修订</button></div>
         </template>
         <p v-if="error" class="error" role="alert">{{ error }}</p>
+        <OperationHistory :events="selected.operationHistory"/>
       </div>
     </dialog>
     <dialog v-if="record" open class="modal" aria-label="整理回流案例">
       <div class="sheet-head"><div><p class="eyebrow">{{ record.externalNumber }}</p><h2>整理回流案例</h2></div><button class="icon-btn" aria-label="取消" @click="record = null"><X :size="22"/></button></div>
-      <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校核</button></div></form>
+      <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校核</button></div><OperationHistory :events="record.operationHistory"/></form>
     </dialog>
   </main>
 </template>

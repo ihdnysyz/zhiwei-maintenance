@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { Activity, Cpu, Plus, RefreshCw, Settings, ShieldCheck, Users, X } from 'lucide-vue-next'
+import OperationHistory from './OperationHistory.vue'
 import { api, date, errorMessage, loadDevices, notice, roleNames, statuses, store, type Role, type Row } from './store'
 
 const tabs = { devices: '设备台账', accounts: '角色与范围', operations: '运行与审计' }
@@ -80,11 +81,14 @@ function reconcile(row: Row, action: string) { return operation(async () => {
         <div class="tag-row"><button class="btn secondary" :disabled="working" @click="testModelConnection">测试模型连接</button><span class="muted">使用固定测试内容检查接口</span></div>
         <p v-for="alert in data?.alerts || []" :key="alert.kind" class="page-error" role="alert">{{ alert.message }} · {{ alert.kind }}</p>
         <h3>外部回写结果</h3><p v-if="!data?.submissions?.length" class="muted">暂无回写记录。</p>
-        <div v-for="row in data?.submissions || []" :key="row.id" class="batch-row"><span>{{ row.requestId }}</span><span class="pill">{{ statuses[row.status] || row.status }}</span><button v-if="['manual_review','not_created'].includes(row.status)" class="btn secondary" @click="reconcile(row, 'check')">查原请求</button><button v-if="row.status === 'not_created' && row.sameKeyRetry" class="btn secondary" @click="reconcile(row, 'retry')">同键重试</button></div>
+        <article v-for="row in data?.submissions || []" :key="row.id" class="batch">
+          <div class="batch-row"><span>{{ row.requestId }}</span><span class="pill">{{ statuses[row.status] || row.status }}</span><button v-if="['manual_review','not_created'].includes(row.status)" class="btn secondary" @click="reconcile(row, 'check')">查原请求</button><button v-if="row.status === 'not_created' && row.sameKeyRetry" class="btn secondary" @click="reconcile(row, 'retry')">同键重试</button></div>
+          <OperationHistory :events="row.operationHistory"/>
+        </article>
         <h3>后台任务</h3><p v-if="!data?.jobs?.length" class="muted">暂无后台任务。</p>
         <div v-for="row in data?.jobs || []" :key="row.id" class="batch-row"><span>{{ { parse: '资料解析', turn: '诊断问答', submit: '工单回写', check: '回写查询' }[row.kind as string] || row.kind }} · {{ row.id.slice(0, 8) }}</span><small v-if="row.error" class="error">{{ row.error }}</small><span class="pill">{{ statuses[row.state] || row.state }}</span></div>
         <h3>关键操作审计</h3><p v-if="!data?.audit?.length" class="muted">暂无操作记录。</p>
-        <div v-for="row in data?.audit || []" :key="row.id" class="batch-row"><span>{{ row.action }} · {{ row.actor }}</span><small>{{ row.requestId?.slice(0, 12) }}</small><small>{{ date(row.created, true) }}</small></div>
+        <div v-for="row in data?.audit || []" :key="row.id" class="batch-row"><span>{{ row.action }} · {{ row.actorName || row.actor }}</span><small>{{ row.requestId?.slice(0, 12) }}</small><small>{{ date(row.created, true) }}</small></div>
       </div>
     </section>
     <div v-if="dialog" class="backdrop" @click="dialog = ''"></div>

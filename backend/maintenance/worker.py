@@ -83,6 +83,7 @@ def finish_external(db, job, result):
     if not row or row.status == "created":
         return
     status, number, retry = result
+    previous = row.status
     since = row.data.get("checkSince", timestamp())
     row.change(status, externalNumber=number, sameKeyRetry=retry, checkSince=since)
     if status == "created":
@@ -99,6 +100,10 @@ def finish_external(db, job, result):
             row.change("manual_review", note="查询超过 15 分钟，待人工核对")
         else:
             db.add(Job(org=job.org, kind="check", target=row.id, available=timestamp() + 30))
+    if row.status != previous:
+        labels = {"created": "外部工单已登记", "not_created": "外部系统确认未创建工单",
+                  "manual_review": "外部工单待人工核对", "processing": "外部工单处理中", "unknown": "外部工单结果待确认"}
+        audit(db, job.org, "worker", labels[row.status], row.id, job.id)
 
 
 def parse_source(job):
@@ -129,7 +134,9 @@ def run(job):
         elif job.kind == "turn":
             with DB() as db:
                 row = find(db, job.org, "turn", id=job.target)
-                result = answer_turn(db, job.org, row) if row and row.status == "queued" else None
+                session = find(db, job.org, "session", id=row.owner) if row else None
+                result = (answer_turn(db, job.org, row)
+                          if session and session.status != "deleted" and row.status == "queued" else None)
         else:
             raise ValueError("不支持的后台操作")
         with DB.begin() as db:
@@ -148,12 +155,13 @@ def run(job):
                                      embedding=vector, embedding_model=cfg.embedding_model if vector is not None else ""))
                     row.change("calibration", indexReady=True, chunkCount=len(document),
                                ocr=any(item[2] for item in document), keywordOnly=degraded)
+                    audit(db, job.org, "worker", "资料解析完成，等待校核", row.id, job.id)
             elif job.kind == "turn":
-                row = find(db, job.org, "turn", id=job.target, lock=True)
-                if row and row.status == "queued" and result:
+                row = find(db, job.org, "turn", id=job.target)
+                session = find(db, job.org, "session", id=row.owner, lock=True) if row else None
+                if session and session.status != "deleted" and row.status == "queued" and result:
                     device = result.pop("_conflictDevice", None)
                     if device:
-                        session = find(db, job.org, "session", id=row.owner, lock=True)
                         result["expertTaskId"] = expert_task(db, job.org, session, row, device, "多份手册命中同一故障码").id
                     row.change("done", **result)
                     current.error = "模型生成降级，已返回授权原文" if result.get("modelDegraded") else ""
@@ -175,8 +183,9 @@ def run(job):
                 row.change("failed", error=display)
             elif job.kind == "turn":
                 row = find(db, job.org, "turn", id=job.target, lock=True)
-                row.change("done", decision="error", referenceIds=[],
-                           answer="问答服务暂时不可用。请重试或将问题转交专家。")
+                if row and row.status == "queued":
+                    row.change("done", decision="error", referenceIds=[],
+                               answer="问答服务暂时不可用。请重试或将问题转交专家。")
             elif job.attempts < 3:
                 current.kind = "check"
                 current.state = "pending"

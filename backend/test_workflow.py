@@ -46,6 +46,11 @@ def do_job(worker, kind):
     worker.run(job)
 
 
+def model_line(payload, text):
+    context = json.loads(payload["messages"][-1]["content"])
+    return next(row["line"] for item in context["evidence"] for row in item["lines"] if row["text"] == text)
+
+
 def upload(client, info, text):
     response = client.post("/api/v1/sources/import", data={"metadata": json.dumps([info])},
                            files={"files": ("manual.txt", text.encode(), "text/plain")})
@@ -91,7 +96,8 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     first, second = get(client, "/devices")
     listed = next(row for row in get(client, "/sources") if row["id"] == source_id)
     assert listed["applicableDeviceId"] == first["id"]
-    assert get(client, f"/sources/{source_id}?deviceId={first['id']}")["active"]
+    published = get(client, f"/sources/{source_id}?deviceId={first['id']}")
+    assert published["active"] and "operationHistory" not in published
     get(client, f"/sources/{source_id}?deviceId={second['id']}", 404)
     other_session = post(client, "/sessions", {"deviceId": second["id"]}, 201)
     other_turns = f"/sessions/{other_session['id']}/turns"
@@ -117,8 +123,14 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     from maintenance import conversations
     monkeypatch.setattr(conversations.cfg, "chat_model", "validation-chat")
     monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
-    monkeypatch.setattr(conversations, "model_call", lambda *_: {
-        "choices": [{"message": {"content": json.dumps({"claims": [{"id": 1, "quote": "K81 表示示例记录提示。"}]})}}]})
+    def model_reply(_, payload):
+        context = json.loads(payload["messages"][-1]["content"])
+        category = context["requestedSource"]
+        text = ("K81 已核实适用条件和处置结果。" if category == "case" else "K81 表示示例记录提示。")
+        claim = {"line": model_line(payload, text)}
+        return {"choices": [{"message": {"content": json.dumps({"claims": [claim]})}}]}
+
+    monkeypatch.setattr(conversations, "model_call", model_reply)
     next_turn = post(client, url, {"text": "K81 提示是什么？", "clientMessageId": uuid4().hex}, 202)
     do_job(worker, "turn")
     result = get(client, f"{url}/{next_turn['id']}")
@@ -172,6 +184,10 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     post(client, "/auth/demo", {"role": "expert"})
     task = post(client, f"/tasks/{task['id']}/actions", {"revision": task["revision"], "action": "reply", "note": "班组已复核。"})
     assert task["status"] == "answered"
+    assert [(event["action"], event["actor"]) for event in task["operationHistory"]] == [
+        ("转交专家", "tech"), ("专家待办·reply", "expert"),
+    ]
+    assert all(event["actorName"] and event["at"] for event in task["operationHistory"])
     assert get(client, "/completed")[0]["id"] == draft["id"]
     post(client, "/auth/demo", {"role": "library"})
     case_input = {"text": "K81 已核实适用条件和处置结果。样本联系方式 13812345678 应当脱敏。"}
@@ -206,12 +222,43 @@ def test_import_review_ask_and_close_workorder(services, monkeypatch):
     assert any(row["sourceId"] == case["id"] for row in get(client, search_url))
     assert not get(client, f"/knowledge/search?deviceId={second['id']}&q=K81")
     assert not get(client, hint_url)["deviceSuggestions"]
+    assert get(client, f"{url}/{turn['id']}")["decision"] == "expired"
     case_session = post(client, "/sessions", {"deviceId": first["id"]}, 201)
     case_turns = f"/sessions/{case_session['id']}/turns"
     case_turn = post(client, case_turns, {"text": "K81 有哪些已结单案例？", "clientMessageId": uuid4().hex}, 202)
     do_job(worker, "turn")
     assert [row["sourceId"] for row in get(client, f"{case_turns}/{case_turn['id']}")["citations"]] == [case["id"]]
-    assert get(client, f"{url}/{turn['id']}")["decision"] == "expired"
+    preserved = get(client, draft_url)
+    assert preserved["sessionAvailable"]
+    assert any(event["action"] == "确认外部结单" and event["actor"] == "tech"
+               for event in preserved["operationHistory"])
+    other = post(client, "/sessions", {"deviceId": first["id"]}, 201)
+    pending = post(client, f"/sessions/{other['id']}/turns",
+                   {"text": "将被删除的临时诊断", "clientMessageId": uuid4().hex}, 202)
+    post(client, "/auth/demo", {"role": "library"})
+    assert client.delete("/api/v1/sessions/" + session["id"]).status_code == 404
+    case_history = get(client, case_url.removesuffix("/actions"))["operationHistory"]
+    assert [(event["action"], event["actor"]) for event in case_history][-2:] == [
+        ("资料·approve", "expert"), ("资料·审核后自动发布", "expert"),
+    ]
+    post(client, "/auth/demo", {"role": "tech"})
+    for session_id in (session["id"], other["id"], session["id"]):
+        assert client.delete("/api/v1/sessions/" + session_id).status_code == 204
+        get(client, "/sessions/" + session_id, 404)
+    do_job(worker, "turn")
+    assert {row["id"] for row in get(client, "/sessions")}.isdisjoint({session["id"], other["id"]})
+    post(client, "/drafts", {"sessionId": session["id"]}, 404)
+    post(client, url, {"text": "删除后不可继续", "clientMessageId": uuid4().hex}, 404)
+    draft_after = get(client, draft_url)
+    assert not draft_after["sessionAvailable"]
+    for key in ("id", "status", "completedAt", "fields", "revision", "references", "operationHistory"):
+        assert draft_after[key] == preserved[key]
+    assert get(client, f"/tasks/{task['id']}")["reply"] == "班组已复核。"
+    assert get(client, "/devices") == [first, second]
+    assert any(item["sourceId"] == case["id"] for item in get(client, search_url))
+    from maintenance.db import DB, find
+    with DB() as db:
+        assert find(db, "demo", "turn", id=pending["id"]) is None
 
 
 def test_pdf_csv_parsers(services):
@@ -350,14 +397,19 @@ def test_device_model_in_question_is_not_copied_as_fault_code(services):
     assert draft["fields"]["faultCode"] == ""
 
 
-def test_grounding_rejects_quote_that_omits_negation(services, monkeypatch):
+def test_grounding_rejects_missing_lines_and_keeps_qualifiers(services, monkeypatch):
     from maintenance import conversations
 
     evidence = [{"category": "manual", "text": "禁止跨型号使用保护参数。"}]
     monkeypatch.setattr(conversations, "model_call", lambda *_: {
-        "choices": [{"message": {"content": json.dumps({"claims": [{"id": 1, "quote": "跨型号使用保护参数。"}]})}}]})
+        "choices": [{"message": {"content": json.dumps({
+            "claims": [{"line": 9, "text": "跨型号使用保护参数。"}],
+        })}}]})
     with pytest.raises(ValueError):
         conversations.grounded_answer("可否跨型号使用保护参数？", evidence)
+    assert conversations.finding_text(evidence[0]["text"], "跨型号可以使用保护参数。") == evidence[0]["text"]
+    assert conversations.finding_text("额定压力为 1.25 MPa。", "额定压力为 2.5 MPa。") == "额定压力为 1.25 MPa。"
+    assert conversations.finding_text("E07 表示温度告警。", "E07 确认是传感器损坏。") == "E07 表示温度告警。"
 
 
 def test_answer_shows_only_the_sources_it_cites(services, monkeypatch):
@@ -375,7 +427,7 @@ def test_answer_shows_only_the_sources_it_cites(services, monkeypatch):
         message = json.loads(payload["messages"][-1]["content"])
         assert message["normalizedFaultCodes"] == ["E07"]
         return {"choices": [{"message": {"content": json.dumps({
-            "claims": [{"id": 1, "quote": "示例故障码 E07 表示温度告警。"}],
+            "claims": [{"line": model_line(payload, "示例故障码 E07 表示温度告警。")}],
         })}}]}
 
     monkeypatch.setattr(conversations, "model_call", model_reply)
@@ -386,6 +438,60 @@ def test_answer_shows_only_the_sources_it_cites(services, monkeypatch):
     result = get(client, f"{url}/{turn['id']}")
     assert result["decision"] == "answer" and "示例故障码 E07 表示温度告警。 [1]" in result["answer"]
     assert [row["number"] for row in result["citations"]] == ["MAN-001"]
+
+
+def test_maintenance_skill_uses_context_to_guide_troubleshooting(services, monkeypatch):
+    from maintenance import conversations
+
+    client, worker = services
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["model"] == "IM-200")
+    session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+    url = f"/sessions/{session['id']}/turns"
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", True)
+    monkeypatch.setattr(conversations.cfg, "chat_model", "validation-chat")
+    first = "电机连续运行一段时间后出现 E07。"
+    second = "这种情况下一步先查什么？"
+    prompts = []
+
+    def model_reply(_, payload):
+        assert payload["messages"][0]["content"] == conversations._ANSWER_SKILL
+        message = json.loads(payload["messages"][-1]["content"])
+        prompts.append(message)
+        evidence = {item["type"]: item for item in message["evidence"]}
+        manual = evidence["manual"]
+        claims = [{"line": model_line(payload, "示例故障码 E07 表示温度告警。"),
+                   "text": "示例中的 E07 是温度告警。"}]
+        if message["question"] == second:
+            cause = "已确认原因：示例环境中通风区域积尘。"
+            claims.extend([{"line": manual["checkLines"][0]},
+                           {"line": model_line(payload, cause), "text": "配合手册确认本次是积尘。"}])
+        reply = {"claims": claims}
+        if message["question"] != first:
+            reply["followUp"] = "load"
+        return {"choices": [{"message": {"content": json.dumps(reply)}}]}
+
+    monkeypatch.setattr(conversations, "model_call", model_reply)
+    for text in (first, second):
+        turn = post(client, url, {"text": text, "clientMessageId": uuid4().hex}, 202)
+        do_job(worker, "turn")
+    result = get(client, f"{url}/{turn['id']}")
+    assert prompts[-1]["question"] == second
+    assert prompts[-1]["previousQuestions"] == [first]
+    assert prompts[-1]["troubleshooting"] and not prompts[-1]["fullProcedureAvailable"]
+    assert result["decision"] == "answer"
+    assert result["answer"].startswith("示例中的 E07 是温度告警。 [1]")
+    assert result["answer"].index("记录告警时间") < result["answer"].index("历史记录（仅供对照）\n已确认原因")
+    assert "确认本次是积尘" not in result["answer"]
+    assert "不足以确认完整维修步骤" in result["answer"]
+    assert "处于什么负载或工况" in result["answer"]
+    assert [row["number"] for row in result["citations"]] == ["MAN-001", "WO-001"]
+    third = post(client, url, {"text": "满负载时才出现", "clientMessageId": uuid4().hex}, 202)
+    do_job(worker, "turn")
+    clarified = get(client, f"{url}/{third['id']}")
+    assert prompts[-1]["lastFollowUp"] == "load" and prompts[-1]["troubleshooting"]
+    assert clarified["decision"] == "answer"
+    assert "处于什么负载或工况" not in clarified["answer"]
 
 
 def test_chat_retries_temporary_provider_failure(services, monkeypatch):
@@ -404,6 +510,38 @@ def test_chat_retries_temporary_provider_failure(services, monkeypatch):
     with pytest.raises(httpx.HTTPStatusError):
         knowledge.model_call("chat/completions", {})
     assert next(codes, None) is None
+
+
+def test_symptom_search_requires_evidence_for_the_reported_signal(services, monkeypatch):
+    from maintenance import conversations
+
+    client, worker = services
+    monkeypatch.setattr(conversations.cfg, "allow_model_data", False)
+    post(client, "/auth/demo", {"role": "tech"})
+    device = next(row for row in get(client, "/devices") if row["number"] == "MTR-001")
+
+    def new_thread():
+        session = post(client, "/sessions", {"deviceId": device["id"]}, 201)
+        return f"/sessions/{session['id']}/turns"
+
+    def ask(path, question):
+        turn = post(client, path, {"text": question, "clientMessageId": uuid4().hex}, 202)
+        do_job(worker, "turn")
+        return get(client, f"{path}/{turn['id']}")
+
+    path = new_thread()
+    result = ask(path, "电机压力异常")
+    assert result["decision"] == "clarify" and result["citations"] == []
+    assert device["name"] in result["answer"] and "测点" in result["answer"]
+    result = ask(path, "出口测点，没有告警")
+    assert result["decision"] == "no_evidence" and result["citations"] == []
+    assert "转交班组专家" in result["answer"]
+    for text in ("电机轴承过热", "电机振动和压力异常"):
+        result = ask(new_thread(), text)
+        assert result["decision"] == "clarify" and result["citations"] == []
+    result = ask(new_thread(), "电机启动后温升异常")
+    assert result["decision"] == "evidence"
+    assert "MAN-001" in {row["number"] for row in result["citations"]}
 
 
 def test_chat_outage_keeps_the_scoped_references(services, monkeypatch):
@@ -449,8 +587,10 @@ def test_new_documents_can_be_approved_for_model_answers(services, monkeypatch):
     def fake_model(endpoint, payload):
         context = json.loads(payload["messages"][-1]["content"])
         outbound.append(context)
-        assert [item["text"] for item in context["evidence"]] == [quote]
-        return {"choices": [{"message": {"content": json.dumps({"claims": [{"id": 1, "quote": quote}]})}}]}
+        assert [line["text"] for item in context["evidence"] for line in item["lines"]] == [quote]
+        return {"choices": [{"message": {"content": json.dumps({
+            "claims": [{"line": model_line(payload, quote)}],
+        })}}]}
 
     monkeypatch.setattr(conversations, "model_call", fake_model)
 
@@ -503,6 +643,14 @@ def test_repair_questions_require_applicable_numbered_manual_steps(services, mon
                 "排查步骤：\n1. 核对样本记录编号。\n2. 对照台账中的记录版本。")
     for incomplete in (original.replace("2. 对照", "3. 对照"), original + "\n第 3 步："):
         assert conversations.procedure_excerpt([{"position": "文本正文", "text": incomplete}], {}, {"L92"}) is None
+    by_symptom = ("故障现象：泵运行但不出水（流量为零）\n"
+                  "排查步骤：\n1. 核对出口指示。\n2. 核对入口条件。\n"
+                  "故障现象：泵流量波动\n排查步骤：\n1. 核对入口记录。")
+    question = "泵运行但不出水怎么查？"
+    entry = {"position": "文本正文", "text": by_symptom}
+    extracted = conversations.procedure_excerpt([entry], {}, set(),
+        signals=conversations.symptom_signals(question), details=conversations.symptom_details(question))
+    assert extracted and "核对入口条件" in extracted[1] and "核对入口记录" not in extracted[1]
     monkeypatch.setattr(conversations.cfg, "allow_model_data", False)
     post(client, "/auth/demo", {"role": "library"})
     info = dict(number="L92-PROCEDURE", version="1.0", title="记录核对验收手册",

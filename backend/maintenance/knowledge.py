@@ -279,9 +279,72 @@ _LOOKUP_FILLER = re.compile(
     r"厂家目录|维修手册|手册|目录|资料|请问|核对|查询|相关|记录|什么|哪[些个]|怎么|如何|一下|的|吗|了"
 )
 _DIAGNOSIS_CUE = re.compile(r"故障|异常|告警|报警|振动|异响|复盘|案例|工单|损坏")
+_SYMPTOM_CUE = re.compile(
+    r"异常|不正常|告警|报警|波动|(?:过|偏|太)[高低大小]|超限|越限|超标|超出|超过|"
+    r"升高|增大|下降|骤降|不稳|不足|过热|超温|发热|欠压|过压|过流|间歇|突变|漏液|漏油|漏水|漏气|渗漏|异响|"
+    r"开不了机|起不来|不启动|(?:无法|不能)(?:启动|起动)|启动失败|不出水|无出水|不供水|没有出水|无流量|流量为零"
+    r"|\b(?:abnormal|alarm|warning|unstable|too (?:high|low)|overheat\w*|leak\w*|excessive|"
+    r"fluctuat\w*|insufficient|won.t start|fails? to start|start(?:up)? failure)\b", re.I
+)
+_DIAGNOSTIC_CONTEXT = re.compile(
+    r"排查|诊断|故障现象|检查|查看|核对|建议记录|\b(?:troubleshoot\w*|diagnos\w*|inspect\w*|check|monitor)\b", re.I
+)
+_NOMINAL_CONTEXT = re.compile(
+    r"额定|名义|选型|标准工况|样本|目录|正常值|正常范围|\b(?:rated|nominal|catalog(?:ue)?|specification)\b", re.I
+)
+_SUPPORT_LINES = re.compile(r"[。！？；;\n]|(?<=[.!?])\s+")
+_SIGNAL_TERMS = {
+    "temperature": re.compile(r"温度|温升|过热|超温|发热|过冷|高温|低温|水温|油温|炉温|壁温|气温|烟温|\b(?:temperatur\w*|overheat\w*)\b", re.I),
+    "pressure": re.compile(r"压力|压差|气压|油压|水压|炉压|负压|\bpressure\b", re.I),
+    "motion": re.compile(r"振动|震动|抖动|晃动|\b(?:vibrat\w*|shak\w*)\b", re.I),
+    "noise": re.compile(r"噪声|噪音|异响|杂音|\b(?:noise|noisy)\b", re.I),
+    "flow": re.compile(r"流量|流速|风量|水量|不出水|无出水|不供水|没有出水|\b(?:flow|airflow|no water)\b", re.I),
+    "head": re.compile(r"扬程|\b(?:pump head|total head|discharge head)\b", re.I),
+    "capacity": re.compile(r"制冷量|冷量|\bcooling capacity\b", re.I),
+    "voltage": re.compile(r"电压|欠压|过压|\b(?:voltage|overvoltage|undervoltage)\b", re.I),
+    "current": re.compile(r"电流|过流|\b(?:current|overcurrent)\b", re.I),
+    "leak": re.compile(r"泄漏|渗漏|漏液|漏油|漏水|漏气|\bleak\w*\b", re.I),
+    "start": re.compile(r"开不了机|起不来|不启动|(?:无法|不能)(?:启动|起动)|启动失败"
+                        r"|\b(?:won.t start|fails? to start|start(?:up)? failure)\b", re.I),
+}
+_MEASURING_POINTS = {
+    "bearing": re.compile(r"轴承|轴瓦|\bbearing\w*\b", re.I),
+    "winding": re.compile(r"绕组|线圈|\b(?:winding\w*|coil\w*)\b", re.I),
+    "furnace": re.compile(r"炉膛|\b(?:furnace|combustion chamber)\b", re.I),
+    "inlet": re.compile(r"入口|进口|进水|进气|吸入口|\b(?:inlet|intake|suction)\b", re.I),
+    "outlet": re.compile(r"出口|出水|排气口|出风口|\b(?:outlet|discharge)\b", re.I),
+    "flue": re.compile(r"烟气|烟温|烟道|\bflue(?: gas)?\b", re.I),
+}
+_SYMPTOM_DIRECTIONS = (
+    re.compile(r"(?:过|偏|太)[高大]|升高|增大|高温|过热|发热|超温|过压|过流"
+               r"|\b(?:high|too large|overheat\w*|overvoltage|overcurrent|excessive)\b", re.I),
+    re.compile(r"(?:过|偏|太)[低小]|下降|骤降|低温|欠压|不足|不出水|无出水|不供水|没有出水|无流量|流量为零"
+               r"|\b(?:low|too small|undervoltage|insufficient)\b", re.I),
+    re.compile(r"波动|不稳|忽高忽低|忽大忽小|\b(?:unstable|fluctuat\w*)\b", re.I),
+)
 
 
-def suggested_device_refs(db, user, device, query, candidates):
+def symptom_signals(value):
+    if not _SYMPTOM_CUE.search(value):
+        return ()
+    return tuple(pattern for pattern in _SIGNAL_TERMS.values() if pattern.search(value))
+
+
+def symptom_details(value):
+    return tuple(pattern for pattern in (*_MEASURING_POINTS.values(), *_SYMPTOM_DIRECTIONS) if pattern.search(value))
+
+
+def supports_symptoms(position, body, signals, details):
+    if not signals:
+        return True
+    lines = [line for line in _SUPPORT_LINES.split(f"{position}\n{body}")
+             if _SYMPTOM_CUE.search(line) or
+             (_DIAGNOSTIC_CONTEXT.search(line) and not _NOMINAL_CONTEXT.search(line))]
+    return all(any(signal.search(line) and all(detail.search(line) for detail in details) for line in lines)
+               for signal in signals)
+
+
+def suggested_device_refs(db, user, device, query, candidates, *, signals=(), details=()):
     if len(query) > 100 or SAFETY.search(query):
         return []
     faults = {code_key(code) for code in fault_codes(query, device)}
@@ -296,6 +359,8 @@ def suggested_device_refs(db, user, device, query, candidates):
         if faults:
             codes = {code_key(code) for code in codes_in(f"{title} {position} {body}")}
             return len(faults) if faults <= codes else 0
+        if not supports_symptoms(position, body, signals, details):
+            return 0
         location = f"{title} {position} {body}" if current else title
         return max((len(phrase) for phrase in phrases if phrase in location), default=0)
 
@@ -343,7 +408,7 @@ def suggested_device_refs(db, user, device, query, candidates):
     return list(suggestions.values())
 
 
-def retrieve(db, org, device, query, limit=6):
+def retrieve(db, org, device, query, limit=6, *, signals=(), details=()):
     set_org(db, org)
     mentioned = {token.lower().rstrip(".") for token in MODEL_TOKEN.findall(query)
                  if any(char.isdigit() for char in token)}
@@ -362,14 +427,16 @@ def retrieve(db, org, device, query, limit=6):
     base = select(Chunk).where(Chunk.org == org, Chunk.source.in_(ids))
     for chunk in db.scalars(base.options(defer(Chunk.embedding))):
         source = sources[chunk.source]
+        if not supports_symptoms(chunk.position, chunk.body, signals, details):
+            continue
         full = f"{source.data['title']} {chunk.position} {chunk.body}"
         exact = faults.intersection(code_key(code) for code in codes_in(full))
         if faults and not exact:
             continue
         matched_faults.update(exact)
-        lexical = sum((tokens & terms(full)).values())
+        lexical = sum((tokens & terms(full)).values()) + len(signals)
         groups[ids[source.id], source.data["category"] == "manual"].append((chunk, len(exact), lexical))
-    if faults - matched_faults:
+    if not groups or faults - matched_faults:
         return [], False
     semantic = {}
     if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:

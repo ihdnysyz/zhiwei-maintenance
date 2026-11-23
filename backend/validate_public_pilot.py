@@ -75,6 +75,33 @@ OTHER_QUESTIONS = [
     ("IM-200", "CASE-001", "电机振动与异响的历史案例提到了哪些现场记录？", "振动发生时间及历史维护单"),
 ]
 
+UNSUPPORTED_SYMPTOMS = [
+    ("煤粉锅炉一次风机（培训）", "锅炉温度异常"),
+    ("煤粉锅炉一次风机（培训）", "一次风机油压偏低"),
+    ("电站循环流化床锅炉（培训）", "锅炉炉膛温度太高"),
+    ("200KQL280-10-11/4", "水泵流量偏低"),
+    ("200KQL280-10-11/4", "水泵扬程偏低"),
+    ("WNS4-1.25-Q", "锅炉蒸汽压力波动"),
+    ("LBC-200", "冷却塔出水温度超标"),
+    ("GCK-1200", "配电柜电压不稳"),
+    ("GCK-1200", "配电柜异响"),
+    ("IM-200", "电机外壳漏油"),
+    ("IM-200", "电机轴承过热"),
+    ("IM-200", "电机振动和压力异常"),
+    ("G120C", "变频器电压太高"),
+    ("30HXC285A", "冷水机组制冷量不足"),
+    ("30HXC285A", "冷水机组运行时有异响"),
+    ("200KQL280-10-11/4", "Water pump flow is too low"),
+    ("LBC-200", "Cooling tower water temperature is too high"),
+]
+SUPPORTED_SYMPTOMS = [
+    ("IM-200", "电机温度异常", "MAN-001", {"MAN-001", "WO-001"}),
+    ("IM-200", "电机振动异响", "CASE-001", {"CASE-001"}),
+    ("G120C", "变频器过热", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
+    ("G120C", "变频器发热严重", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
+    ("G120C", "变频器欠压", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
+]
+
 
 def request(client, method, path, expected=200, **kwargs):
     response = client.request(method, "/api/v1/" + path, **kwargs)
@@ -219,6 +246,15 @@ def exercise(live_model, corpus):
         _, _, turn = answer(client, unverified_drive, "F30005 是什么故障？")
         if turn["decision"] != "clarify" or turn["citations"]:
             failures.append((turn["decision"], "G120C unknown firmware"))
+        for model, question in UNSUPPORTED_SYMPTOMS:
+            _, _, turn = answer(client, devices[model], question)
+            if turn["decision"] != "clarify" or turn["citations"]:
+                failures.append((turn["decision"], question))
+        for model, question, required, allowed in SUPPORTED_SYMPTOMS:
+            _, _, turn = answer(client, devices[model], question)
+            references = {row["number"] for row in turn["citations"]}
+            if turn["decision"] not in {"answer", "evidence"} or required not in references or not references <= allowed:
+                failures.append((turn["decision"], question))
 
         session, history, turn = answer(client, devices["LBC-200"], QUESTIONS["LBC-200"][0][0])
         assert turn["citations"] and turn["citations"][0]["number"] == "PUB-LBC200"
@@ -246,7 +282,8 @@ def exercise(live_model, corpus):
             "sources": len(active), "sources_with_passing_answers": len(covered), "live_model": live_model,
             "grounded_questions_passed": evidence_checks,
             "grounded_questions_total": len(checks),
-            "boundary_questions": len(negative) + 1,
+            "boundary_questions": len(negative) + 1 + len(UNSUPPORTED_SYMPTOMS),
+            "supported_symptom_questions": len(SUPPORTED_SYMPTOMS),
             "workflow": "original, scope, draft, export and withdrawal passed",
             "seconds": round(time.monotonic() - started, 1), "failures": failures,
         }, ensure_ascii=False))

@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { ArrowDownToLine, ArrowUpRight, BookOpen, ClipboardList, CloudUpload, FileSearch, FileText, History, Plus, RefreshCw, Search, Wrench, X } from 'lucide-vue-next'
 import { useRoute } from 'vue-router'
+import OperationHistory from './OperationHistory.vue'
 import { api, categories, date, errorMessage, notice, statuses, store, type Row } from './store'
 
 interface UploadItem { file: File; title: string; number: string; version: string; model: string; batch: string; category: string; referenceUrl: string }
@@ -183,6 +184,7 @@ function closeDetail() { detailGeneration++; loadingDetail = false; detail.value
       <article v-for="batch in batches" :key="batch.id" class="batch">
         <div class="section-head"><div><b>批次 {{ batch.id.slice(0, 8) }}</b><p>{{ date(batch.created, true) }} · {{ batch.items.length }} 份资料</p></div><button v-if="batch.items.some((item: Row) => item.status === 'failed' && item.sourceId)" class="btn secondary" @click="retry(batch.id)">重试失败项</button></div>
         <div v-for="(item, index) in batch.items" :key="index" class="batch-row"><FileText :size="17"/><span>{{ item.filename }}</span><small v-if="item.error" class="error">{{ item.error }}</small><span class="pill">{{ statuses[item.status] || item.status }}</span><button v-if="item.status === 'conflict'" class="btn secondary" @click="conflict = item; conflictVersion = ''; errorText = ''">处理冲突</button></div>
+        <OperationHistory :events="batch.operationHistory"/>
       </article>
     </section>
     <section v-else class="card list-card">
@@ -217,6 +219,7 @@ function closeDetail() { detailGeneration++; loadingDetail = false; detail.value
         <label>作为新版本重新导入<input v-model="conflictVersion" placeholder="输入尚未使用的版本号" maxlength="40" required/></label>
         <p v-if="errorText" class="error" role="alert">{{ errorText }}</p>
         <div class="button-row"><button type="button" class="btn secondary" :disabled="working" @click="resolveConflict('discard')">保留原版本</button><button class="btn primary" :disabled="working">登记新版本</button></div>
+        <OperationHistory :events="conflict.operationHistory"/>
       </form>
     </dialog>
     <dialog v-if="openUpload" open class="modal wide" aria-label="批量导入资料">
@@ -281,6 +284,7 @@ function closeDetail() { detailGeneration++; loadingDetail = false; detail.value
           <div class="button-row"><button v-if="detail.active" class="btn secondary" :disabled="working" @click="action('block')">下架适用范围</button><button v-if="!detail.active || schedule" class="btn primary" :disabled="working" @click="action('publish')">发布该版本</button></div>
         </template>
         <p v-if="errorText" class="error" role="alert">{{ errorText }}</p>
+        <OperationHistory :events="detail.operationHistory"/>
       </div>
     </dialog>
   </main>

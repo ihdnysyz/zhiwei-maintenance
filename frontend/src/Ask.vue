@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, BookOpen, ChevronDown, ChevronRight, CircleAlert, ClipboardPlus, Cpu, History, LoaderCircle, Plus, Search, Sparkles, Users, X } from 'lucide-vue-next'
+import { ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp, ArrowUpRight, BookOpen, ChevronDown, ChevronRight, CircleAlert, ClipboardPlus, Cpu, History, LoaderCircle, Plus, Search, Sparkles, Trash2, Users, X } from 'lucide-vue-next'
 import { useRoute, useRouter } from 'vue-router'
-import { api, categories, errorMessage, notice, store, type Row } from './store'
+import { api, categories, errorMessage, notice, request, store, type Row } from './store'
 
 const router = useRouter()
 const route = useRoute()
@@ -19,6 +19,9 @@ const pickDevice = ref(false)
 const showHistory = ref(false)
 const loading = ref(false)
 const sending = ref(false)
+const deleteTarget = ref<Row | null>(null)
+const deleting = ref(false)
+const removedIds = new Set<string>()
 const composer = ref<HTMLTextAreaElement>()
 const bottom = ref<HTMLElement>()
 let timer: number | undefined
@@ -40,7 +43,7 @@ const matchedDevices = computed(() => {
   })
 })
 const safeScroll = () => nextTick(() => bottom.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))
-async function history() { sessions.value = await api<Row[]>('/sessions') }
+async function history() { sessions.value = (await api<Row[]>('/sessions')).filter(row => !removedIds.has(row.id)) }
 onMounted(() => history().catch(error => notice(errorMessage(error), true)))
 onUnmounted(() => { active = false; clearTimeout(timer) })
 watch(() => [route.params.id, route.query.q, route.query.device], async ([id, query, requestedDevice]) => {
@@ -56,6 +59,7 @@ watch(() => [route.params.id, route.query.q, route.query.device], async ([id, qu
     if (selected) deviceId.value = selected.id
     return
   }
+  session.value = null
   loading.value = true
   try {
     const row = await api<Row>('/sessions/' + id)
@@ -80,8 +84,13 @@ function poll() {
       session.value.turns = session.value.turns.map((row: Row) => row.id === result.id ? result : row)
       if (result.status !== 'queued') safeScroll()
       else poll()
-    } catch {
-      if (active && session.value?.id === id) poll()
+    } catch (error) {
+      if (!active || session.value?.id !== id) return
+      if (errorMessage(error) === '此对话已删除') {
+        removedIds.add(id)
+        sessions.value = sessions.value.filter(row => row.id !== id)
+        void newSession()
+      } else poll()
     }
   }, 850)
 }
@@ -143,6 +152,28 @@ async function newSession() {
   else if (route.query.q || route.query.device) await router.replace('/ask')
   composer.value?.focus()
 }
+function closeDelete() {
+  if (!deleting.value) deleteTarget.value = null
+}
+async function deleteSession() {
+  const id = deleteTarget.value?.id
+  if (!id || deleting.value) return
+  deleting.value = true
+  try {
+    await request('/sessions/' + id, 'DELETE')
+    removedIds.add(id)
+    sessions.value = sessions.value.filter(row => row.id !== id)
+    if (route.params.id === id || session.value?.id === id) {
+      clearTimeout(timer)
+      session.value = null
+      retryKey = undefined
+      await newSession()
+    }
+    deleteTarget.value = null
+    notice('对话已删除')
+  } catch (error) { notice(errorMessage(error), true) }
+  finally { deleting.value = false }
+}
 async function createDraft() {
   if (!session.value) return
   try {
@@ -170,7 +201,10 @@ async function escalate() {
         <button class="btn secondary new-chat" @click="newSession"><Plus :size="18"/> 新建诊断</button>
         <h2><History :size="15"/> 诊断记录</h2>
         <p v-if="!sessions.some(row => row.sequence)" class="muted history-empty">暂无诊断记录</p>
-        <RouterLink v-for="row in sessions.filter(item => item.sequence)" :key="row.id" :to="'/ask/' + row.id" :class="{ current: session?.id === row.id }" @click="showHistory = false"><b>{{ row.title }}</b><small>{{ row.deviceNumber }}</small></RouterLink>
+        <div v-for="row in sessions.filter(item => item.sequence)" :key="row.id" class="history-entry">
+          <RouterLink :to="'/ask/' + row.id" :class="{ current: session?.id === row.id }" @click="showHistory = false"><b>{{ row.title }}</b><small>{{ row.deviceNumber }}</small></RouterLink>
+          <button class="icon-btn delete-conversation" :aria-label="'删除对话 ' + row.title" title="删除对话" :disabled="sending || deleting" @click="deleteTarget = row"><Trash2 :size="16"/></button>
+        </div>
       </aside>
       <section class="card chat-card">
         <div class="chat-head">
@@ -243,7 +277,14 @@ async function escalate() {
         </div>
       </div>
     </dialog>
-    <div v-if="evidence || escalateTurn" class="backdrop" @click="evidence = null; escalateTurn = null"></div>
+    <div v-if="evidence || escalateTurn || deleteTarget" class="backdrop" @click="evidence = null; escalateTurn = null; closeDelete()"></div>
+    <dialog v-if="deleteTarget" open class="modal" aria-label="删除对话" @keydown.esc.prevent="closeDelete">
+      <div class="sheet-head"><h2>删除这条对话？</h2><button class="icon-btn" aria-label="关闭" :disabled="deleting" @click="closeDelete"><X :size="22"/></button></div>
+      <div class="sheet-body form-stack">
+        <p>「{{ deleteTarget.title }}」将从诊断记录中删除。已提交到工单和专家待办的内容仍可在原业务记录中查看。</p>
+        <div class="button-row"><button class="btn secondary" :disabled="deleting" @click="closeDelete">取消</button><button class="btn destructive" :disabled="deleting" @click="deleteSession">{{ deleting ? '正在删除…' : '删除对话' }}</button></div>
+      </div>
+    </dialog>
     <dialog v-if="escalateTurn" open class="modal" aria-label="转交班组专家">
       <div class="sheet-head"><h2>{{ feedback ? '反馈答复或引用' : '转交班组专家' }}</h2><button class="icon-btn" aria-label="取消" @click="escalateTurn = null"><X :size="22"/></button></div>
       <form class="sheet-body form-stack" @submit.prevent="escalate"><p>{{ escalateTurn.text }}</p><label>补充说明<textarea v-model="note" rows="4" maxlength="1500" :required="feedback" placeholder="补充现场条件或需要核实的内容"></textarea></label><div class="button-row"><button class="btn primary">提交专家待办</button></div></form>

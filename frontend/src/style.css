@@ -184,6 +184,18 @@ textarea { resize: vertical; }
 .history-panel a:hover, .history-panel a.current { background: var(--mint); color: var(--pine-dark); }
 .history-panel a b,.history-panel a small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .history-panel a small { color: var(--muted); font-size: 12px; }
+.history-entry { display: flex; align-items: center; gap: 4px; }
+.history-entry a { flex: 1; min-width: 0; }
+.delete-conversation { color: var(--muted); flex: none; }
+.delete-conversation:hover { color: #a83230; background: #fbeeee; }
+.btn.destructive { color: white; background: #a83230; border-color: #a83230; }
+.btn.destructive:hover:not(:disabled) { background: #8a2524; }
+.operation-history { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 10px; }
+.operation-history ol { list-style: none; margin: 8px 0 0; padding: 0; max-height: 19rem; overflow: auto; }
+.operation-history li { display: grid; grid-template-columns: minmax(100px, 1fr) minmax(90px, auto); gap: 2px 12px; padding: 8px 0; font-size: 14px; }
+.operation-history li + li { border-top: 1px solid var(--line); }
+.operation-history li > span { text-align: right; overflow-wrap: anywhere; }
+.operation-history time { color: var(--muted); grid-column: 1 / -1; }
 .chat-card { min-height: 530px; height: min(700px,max(530px, calc(100dvh - 219px))); position: relative; display: flex; flex-direction: column; }
 .chat-head { padding: 12px 17px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 9px; min-height: 61px; }
 .chat-model { color: #4a6f5d; font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }

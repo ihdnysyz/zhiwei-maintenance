@@ -188,7 +188,21 @@ def add(db, org, kind, *, key=None, owner="", status="", blob=None, **data):
 
 
 def audit(db, org, actor, action, target, request_id=""):
-    add(db, org, "audit", owner=actor, action=action, target=target, actor=actor, requestId=request_id)
+    key, name = (actor.key, actor.data["name"]) if isinstance(actor, Record) else (actor, "")
+    add(db, org, "audit", owner=key, action=action, target=target, actor=key, actorName=name, requestId=request_id)
+
+
+def audit_events(db, org, targets):
+    if not targets:
+        return []
+    events = list(db.scalars(records(org, "audit").where(Record.data["target"].as_string().in_(targets))
+                             .order_by(Record.created, Record.id)))
+    unnamed = {row.owner for row in events if not row.data.get("actorName") and row.owner != "worker"}
+    names = ({row.key: row.data["name"] for row in db.scalars(records(org, "user").where(Record.key.in_(unnamed)))}
+             if unnamed else {})
+    return [dict(id=row.id, action=row.data["action"], target=row.data["target"], actor=row.owner, at=row.created,
+                 actorName=row.data.get("actorName") or ("系统（后台）" if row.owner == "worker" else names.get(row.owner, row.owner)))
+            for row in events]
 
 
 def enqueue(db, org, kind, target):

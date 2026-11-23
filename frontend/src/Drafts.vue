@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import { ArrowDownToLine, ArrowLeft, BookOpen, Check, ChevronRight, ClipboardList, File, Link2, Paperclip, Save, ShieldCheck, X } from 'lucide-vue-next'
 import { useRoute } from 'vue-router'
+import OperationHistory from './OperationHistory.vue'
 import { api, date, errorMessage, notice, request, statuses, store, type Row } from './store'
 
 const route = useRoute()
@@ -135,7 +136,7 @@ function markDone() { return modify(async () => {
       <aside class="form-stack">
         <section class="card content-card"><div class="section-head"><div><h2>参考依据</h2><p>来自诊断会话中的适用资料</p></div><BookOpen :size="20" class="muted"/></div>
           <button v-for="item in draft.references" :key="item.id" class="source-row short" @click="selectedRef = item"><span class="source-main"><b>{{ item.title }}</b><small>{{ item.position }} · V{{ item.version }}</small></span><ChevronRight :size="16"/></button>
-          <p v-if="!draft.references?.length" class="muted">当前没有可用的引用。</p><RouterLink class="text-link" :to="'/ask/' + draft.sessionId">回到诊断会话 <ChevronRight :size="15"/></RouterLink>
+          <p v-if="!draft.references?.length" class="muted">当前没有可用的引用。</p><RouterLink v-if="draft.sessionAvailable" class="text-link" :to="'/ask/' + draft.sessionId">回到诊断会话 <ChevronRight :size="15"/></RouterLink><p v-else class="muted">来源对话已删除。</p>
         </section>
         <section class="card content-card form-stack">
           <div class="section-head"><div><h2>导出与登记</h2><p>现场确认后可导出工单快照。</p></div><Link2 :size="20" class="muted"/></div>
@@ -148,6 +149,7 @@ function markDone() { return modify(async () => {
             <button class="btn primary own-width" :disabled="busy" @click="markDone">确认外部工单已结单</button>
           </template>
           <div v-if="submission"><p class="muted">回写请求 {{ submission.requestId }} · {{ statuses[submission.status] || submission.status }}</p><button class="btn secondary own-width" :disabled="busy" @click="refresh">查询原请求</button></div>
+          <OperationHistory :events="draft.operationHistory"/>
         </section>
       </aside>
     </div>

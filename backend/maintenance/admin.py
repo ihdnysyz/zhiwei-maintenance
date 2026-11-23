@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from .common import actor, fail, get_db, need, permitted_device, revision, role
 from .conversations import redact, turn_view
-from .db import Job, Record, Scope, add, audit, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
+from .db import Job, Record, Scope, add, audit, audit_events, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
 from .library import queue_source
 from .knowledge import model_call
 from .worker import external_headers
@@ -67,7 +67,7 @@ def devices(user=Depends(actor), db=Depends(get_db, scope="function")):
 def upsert_device(body: DeviceBody, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "platform")
     value = device_row(db, user.org, body.model_dump())
-    audit(db, user.org, user.key, "台账更新", value["id"], request.state.request_id)
+    audit(db, user.org, user, "台账更新", value["id"], request.state.request_id)
     return value
 
 
@@ -84,7 +84,7 @@ def sync_devices(request: Request, user=Depends(actor), db=Depends(get_db, scope
         fail(502, "REGISTRY_FAILED", "台账同步失败，原有设备记录已保留")
     for info in rows:
         device_row(db, user.org, info)
-    audit(db, user.org, user.key, "台账同步", str(len(rows)), request.state.request_id)
+    audit(db, user.org, user, "台账同步", str(len(rows)), request.state.request_id)
     return {"count": len(rows)}
 
 
@@ -110,7 +110,7 @@ def upsert_account(body: Account, request: Request, user=Depends(actor), db=Depe
         row.change(status, **data)
     else:
         row = add(db, user.org, "user", key=body.username, status=status, **data)
-    audit(db, user.org, user.key, "账号权限更新", row.id, request.state.request_id)
+    audit(db, user.org, user, "账号权限更新", row.id, request.state.request_id)
     return row.view("password")
 
 
@@ -137,7 +137,8 @@ def task(task_id: str, user=Depends(actor), db=Depends(get_db, scope="function")
         fail(404, "NOT_FOUND", "待办不存在")
     session = need(find(db, user.org, "session", id=row.data["sessionId"]))
     turn = need(find(db, user.org, "turn", id=row.data["turnId"]))
-    return {**task_view(row), "turn": turn_view(db, user, turn, session)}
+    return {**task_view(row), "turn": turn_view(db, user, turn, session),
+            "operationHistory": audit_events(db, user.org, [row.id])}
 
 
 @router.post("/tasks/{task_id}/actions")
@@ -167,10 +168,11 @@ def task_action(task_id: str, body: TaskAction, request: Request, user=Depends(a
                     model=row.data["model"], batch="", category="case")
         source, _ = queue_source(db, user.org, user.key, info, "修订候选.txt", redact(note).encode())
         row.change(revisionCandidate=source.id)
+        audit(db, user.org, user, "提交知识修订", source.id, request.state.request_id)
     else:
         fail(409, "TASK_STATE", "当前状态不支持此操作，或需要补充答复")
-    audit(db, user.org, user.key, "专家待办·" + body.action, row.id, request.state.request_id)
-    return row.view()
+    audit(db, user.org, user, "专家待办·" + body.action, row.id, request.state.request_id)
+    return {**task_view(row), "operationHistory": audit_events(db, user.org, [row.id])}
 
 
 @router.post("/drafts/{draft_id}/case")
@@ -192,7 +194,8 @@ def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(acto
                 model=device["model"], batch=device["batch"], category="case")
     case, _ = queue_source(db, user.org, user.key, info, "脱敏案例.txt", text)
     case.change(workorderLocator=row.data["externalNumber"])
-    audit(db, user.org, user.key, "工单案例回流", case.id, request.state.request_id)
+    audit(db, user.org, user, "工单案例回流", case.id, request.state.request_id)
+    audit(db, user.org, user, "工单案例回流", row.id, request.state.request_id)
     return case.view("digest")
 
 
@@ -210,9 +213,13 @@ def completed(user=Depends(actor), db=Depends(get_db, scope="function")):
                if permitted_device(user, row.data)}
     active = {row.source for row in db.scalars(current_scopes(user.org).where(
         Scope.status == "bind", Scope.source.in_({row.id for row in sources.values()})))}
+    histories = {}
+    for event in audit_events(db, user.org, keys.keys()):
+        histories.setdefault(event["target"], []).append(event)
     result = []
     for draft in drafts:
         item = draft.view("snapshot", "changes", "origins")
+        item["operationHistory"] = histories.get(draft.id, [])
         case = sources.get(keys[draft.id])
         if case:
             item["caseSource"] = dict(id=case.id, status=case.status, active=case.id in active)
@@ -225,7 +232,10 @@ def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "platform")
     jobs = list(db.scalars(select(Job).where(Job.org == user.org).order_by(Job.available.desc()).limit(100)))
     history = db.scalars(records(user.org, "audit").order_by(Record.created.desc()).limit(100))
-    submissions = db.scalars(records(user.org, "submission").order_by(Record.updated.desc()).limit(100))
+    submissions = list(db.scalars(records(user.org, "submission").order_by(Record.updated.desc()).limit(100)))
+    submission_history = {}
+    for event in audit_events(db, user.org, [row.id for row in submissions]):
+        submission_history.setdefault(event["target"], []).append(event)
     alerts = []
     for kind in ("turn", "parse", "submit", "check"):
         recent = [job for job in jobs if job.kind == kind and job.state in {"done", "failed"}][:5]
@@ -233,7 +243,8 @@ def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
             alerts.append({"kind": kind, "message": "连续 5 个后台任务失败或降级"})
     return dict(alerts=alerts, jobs=[dict(id=job.id, kind=job.kind, state=job.state, attempts=job.attempts,
                            error=job.error) for job in jobs], audit=[row.view() for row in history],
-                submissions=[row.view("payload") for row in submissions],
+                submissions=[{**row.view("payload"), "operationHistory": submission_history.get(row.id, [])}
+                             for row in submissions],
                 integrations=dict(model=bool(cfg.model_url and cfg.model_key and cfg.allow_model_data and cfg.chat_model),
                                   embedding=bool(cfg.embedding_model and cfg.allow_model_data and not cfg.model_source_review),
                                   identity=bool(cfg.id_userinfo_url),
@@ -273,7 +284,8 @@ class SubmissionAction(BaseModel):
 
 
 @router.post("/submissions/{submission_id}/actions", status_code=202)
-def check_submission(submission_id: str, body: SubmissionAction, user=Depends(actor), db=Depends(get_db, scope="function")):
+def check_submission(submission_id: str, body: SubmissionAction, request: Request,
+                     user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "platform")
     row = need(find(db, user.org, "submission", id=submission_id, lock=True))
     revision(row, body.revision)
@@ -287,5 +299,6 @@ def check_submission(submission_id: str, body: SubmissionAction, user=Depends(ac
     else:
         row.change("processing", checkSince=timestamp())
         enqueue(db, user.org, "check", row.id)
+    audit(db, user.org, user, "外部工单·重试" if body.action == "retry" else "外部工单·核对", row.id, request.state.request_id)
     return row.view("payload")
 

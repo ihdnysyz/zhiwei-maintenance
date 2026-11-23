@@ -12,7 +12,7 @@ from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from .common import actor, device_for, fail, get_db, need, permitted_device, revision, role
-from .db import Chunk, Record, Scope, add, audit, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
+from .db import Chunk, Record, Scope, add, audit, audit_events, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
 from .knowledge import KINDS, applicability, authorized_citation, embeddings, model_approval_endpoint, retrieve
 
 router = APIRouter()
@@ -128,12 +128,14 @@ def import_sources(request: Request, files: Annotated[list[UploadFile], File()],
             continue
         row, status = queue_source(db, user.org, user.key, info, filename, raw)
         items.append(dict(filename=filename, sourceId=row.id, status=status))
+        if status in {"queued", "conflict"}:
+            audit(db, user.org, user, "导入资料" if status == "queued" else "发现资料版本冲突", row.id, request.state.request_id)
     batch = add(db, user.org, "import", owner=user.key, items=items)
-    audit(db, user.org, user.key, "资料导入", batch.id, request.state.request_id)
+    audit(db, user.org, user, "资料导入", batch.id, request.state.request_id)
     return batch.view()
 
 
-def import_view(db, user, batch):
+def import_view(db, user, batch, histories):
     result = []
     for item in batch.data["items"]:
         display = {**item}
@@ -144,33 +146,52 @@ def import_view(db, user, batch):
             row = find(db, user.org, "conflict", id=item["sourceId"])
             if row:
                 display.update(status=row.status, revision=row.rev, version=row.data["version"])
+                if permitted_device(user, row.data):
+                    display["operationHistory"] = histories.get(row.id, [])
         result.append(display)
-    return {**batch.view(), "items": result}
+    return {**batch.view(), "items": result, "operationHistory": histories.get(batch.id, [])}
+
+
+def import_histories(db, user, batches):
+    targets = {batch.id for batch in batches}
+    targets.update(item["sourceId"] for batch in batches for item in batch.data["items"] if item["status"] == "conflict")
+    histories = {}
+    for event in audit_events(db, user.org, targets):
+        histories.setdefault(event["target"], []).append(event)
+    return histories
 
 
 @router.get("/imports")
 def imports(user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library")
-    return [import_view(db, user, row) for row in db.scalars(records(user.org, "import").order_by(Record.updated.desc()).limit(30))]
+    batches = list(db.scalars(records(user.org, "import").order_by(Record.updated.desc()).limit(30)))
+    histories = import_histories(db, user, batches)
+    return [import_view(db, user, row, histories) for row in batches]
 
 
 @router.get("/imports/{batch_id}")
 def get_import(batch_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library")
-    return import_view(db, user, need(find(db, user.org, "import", id=batch_id)))
+    batch = need(find(db, user.org, "import", id=batch_id))
+    return import_view(db, user, batch, import_histories(db, user, [batch]))
 
 
 @router.post("/imports/{batch_id}/retry", status_code=202)
-def retry_import(batch_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
+def retry_import(batch_id: str, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "library")
     batch = need(find(db, user.org, "import", id=batch_id))
+    retried = False
     for item in batch.data["items"]:
         if item["status"] == "queued":
             row = find(db, user.org, "source", id=item["sourceId"], lock=True)
             if row and row.status == "failed" and permitted_device(user, row.data):
                 row.change("queued", error="")
                 enqueue(db, user.org, "parse", row.id)
-    return import_view(db, user, batch)
+                audit(db, user.org, user, "重新解析资料", row.id, request.state.request_id)
+                retried = True
+    if retried:
+        audit(db, user.org, user, "重新解析失败的资料", batch.id, request.state.request_id)
+    return import_view(db, user, batch, import_histories(db, user, [batch]))
 
 
 @router.post("/conflicts/{conflict_id}/resolve")
@@ -190,9 +211,10 @@ def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
         info["version"] = body.version
         source, _ = queue_source(db, user.org, user.key, info, row.data["filename"], row.blob)
         row.change("resolved", replacementId=source.id)
+        audit(db, user.org, user, "按新版本导入资料", source.id, request.state.request_id)
     else:
         row.change("discarded")
-    audit(db, user.org, user.key, "裁定资料版本冲突", row.id, request.state.request_id)
+    audit(db, user.org, user, "裁定资料版本冲突", row.id, request.state.request_id)
     return row.view("digest")
 
 
@@ -207,14 +229,15 @@ def get_source(source_id: str, deviceId: str = "", user=Depends(actor), db=Depen
         if row.id not in allowed:
             fail(404, "NOT_APPLICABLE", "此资料不在当前设备的生效范围内")
     set_org(db, user.org)
-    chunks = db.scalars(select(Chunk).where(Chunk.org == user.org, Chunk.source == row.id))
+    chunks = list(db.scalars(select(Chunk).where(Chunk.org == user.org, Chunk.source == row.id)))
     history = [scope.view() for scope in db.scalars(scopes(user.org).where(
         Scope.number == row.data["number"]).order_by(Scope.start.desc()))] if manager else []
     active = db.scalar(current_scopes(user.org).where(Scope.source == row.id, Scope.status == "bind").limit(1)) is not None
     if manager:
         host, endpoint_key = model_approval_endpoint()
         fields = {**row.view("digest", "approvedModelEndpoint"), "modelApprovalHost": host,
-                  "externalModelApproved": bool(endpoint_key and endpoint_key == row.data.get("approvedModelEndpoint"))}
+                  "externalModelApproved": bool(endpoint_key and endpoint_key == row.data.get("approvedModelEndpoint")),
+                  "operationHistory": audit_events(db, user.org, [row.id, *(chunk.id for chunk in chunks)])}
     else:
         fields = row.view("digest", "reviewer", "verifiedBy", "note", "approvedDigest", "approvedModelEndpoint")
     return {**fields, "active": active, "chunks": [chunk.view() for chunk in chunks], "scopes": history}
@@ -258,7 +281,7 @@ def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request
     summary = digest(json.dumps([original, *[(item.position, item.body) for item in chunks]],
                                 ensure_ascii=False).encode())
     row.change("calibration", digest=summary, importDigest=original, approvedDigest="", keywordOnly=keyword_only)
-    audit(db, user.org, user.key, "校正解析片段", target.id, request.state.request_id)
+    audit(db, user.org, user, "校正解析片段", row.id, request.state.request_id)
     return row.view("digest", "importDigest")
 
 
@@ -326,17 +349,17 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
             fail(409, "MODEL_APPROVAL_DISABLED", "当前未启用按资料授权的回答模型")
         source.change("approved" if approved else "returned", reviewer=user.key, note=body.note,
                       approvedDigest=data.get("digest") if approved else "", approvedModelEndpoint=endpoint_key)
-        if approved and data["category"] == "case" and data.get("workorderLocator"):
-            apply_publication_scope(db, source)
-            audit(db, user.org, user.key, "资料·审核后自动发布", source.id, request.state.request_id)
     elif body.action in {"publish", "block"} and source.status in {"approved", "published", "withdrawn"}:
         apply_publication_scope(db, source, bind=body.action == "publish", start_at=body.start,
                                 end_at=body.end, batch_override=body.batch)
     else:
         fail(409, "SOURCE_STATE", "当前资料状态不支持此操作")
-    audit(db, user.org, user.key, "资料·" + body.action, source.id, request.state.request_id)
+    audit(db, user.org, user, "资料·" + body.action, source.id, request.state.request_id)
     if body.allowExternalModel:
-        audit(db, user.org, user.key, "资料·授权回答模型", source.id, request.state.request_id)
+        audit(db, user.org, user, "资料·授权回答模型", source.id, request.state.request_id)
+    if body.action == "approve" and data["category"] == "case" and data.get("workorderLocator"):
+        apply_publication_scope(db, source)
+        audit(db, user.org, user, "资料·审核后自动发布", source.id, request.state.request_id)
     return source.view("digest", "approvedModelEndpoint")
 
 

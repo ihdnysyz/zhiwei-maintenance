@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends, File, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .common import actor, device_for, fail, get_db, need, own, revision
-from .conversations import session_turns, turn_view
-from .db import Record, add, audit, cfg, digest, enqueue, find, now, records, uid
+from .conversations import active_session, session_turns, turn_view
+from .db import Record, add, audit, audit_events, cfg, digest, enqueue, find, now, records, uid
 from .knowledge import fault_codes
 from .library import file_response
 
@@ -60,7 +60,10 @@ def view(db, user, row):
         turn = find(db, user.org, "turn", id=row.data["turnId"])
         if turn:
             ref = turn_view(db, user, turn, session).get("citations", [])
-    return {**row.view("snapshot"), "references": ref,
+    submission = find(db, user.org, "submission", key=row.id) if row.status in {"submitting", "linked"} else None
+    targets = [row.id, submission.id] if submission else [row.id]
+    return {**row.view("snapshot"), "references": ref, "sessionAvailable": bool(session and session.status != "deleted"),
+            "operationHistory": audit_events(db, user.org, targets),
             "attachments": [item.view() for item in attachments(db, user.org, row.id)]}
 
 
@@ -77,7 +80,7 @@ def list_drafts(user=Depends(actor), db=Depends(get_db, scope="function")):
 
 @router.post("/drafts", status_code=201)
 def create(body: DraftCreate, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    session = own(db, user, "session", body.sessionId, lock=True)
+    session = active_session(db, user, body.sessionId, lock=True)
     device = device_for(db, user, session.data["deviceId"])
     turns = session_turns(db, user.org, session)
     if not turns:
@@ -94,7 +97,7 @@ def create(body: DraftCreate, request: Request, user=Depends(actor), db=Depends(
               turnId=last.id, device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
               fields=fields, origins={"symptom": "会话现场描述", "faultCode": "最近一轮现场描述" if fault else "",
                                      "device": "设备台账"}, changes=[], snapshot=None)
-    audit(db, user.org, user.key, "生成工单草稿", row.id, request.state.request_id)
+    audit(db, user.org, user, "生成工单草稿", row.id, request.state.request_id)
     return view(db, user, row)
 
 
@@ -116,12 +119,13 @@ def patch_draft(draft_id: str, body: DraftPatch, request: Request, user=Depends(
             origins[key] = "经办人填写"
     if len(changes) != len(row.data["changes"]):
         row.change("draft", fields={**old, **body.fields}, origins=origins, changes=changes, snapshot=None)
-        audit(db, user.org, user.key, "编辑工单草稿", row.id, request.state.request_id)
+        audit(db, user.org, user, "编辑工单草稿", row.id, request.state.request_id)
     return view(db, user, row)
 
 
 @router.post("/drafts/{draft_id}/attachments", status_code=201)
-def attach(draft_id: str, revisionId: int, file: UploadFile = File(), user=Depends(actor), db=Depends(get_db, scope="function")):
+def attach(draft_id: str, revisionId: int, request: Request, file: UploadFile = File(), user=Depends(actor),
+           db=Depends(get_db, scope="function")):
     row = own(db, user, "draft", draft_id, lock=True)
     revision(row, revisionId)
     mutable(row)
@@ -148,6 +152,7 @@ def attach(draft_id: str, revisionId: int, file: UploadFile = File(), user=Depen
     add(db, user.org, "attachment", owner=row.id, status="ready", filename=filename,
         media=spec[0], bytes=len(blob), sha256=digest(blob), blob=blob)
     row.change("draft", snapshot=None)
+    audit(db, user.org, user, "添加工单附件", row.id, request.state.request_id)
     db.flush()
     return view(db, user, row)
 
@@ -163,7 +168,8 @@ def read_attachment(draft_id: str, attachment_id: str, user=Depends(actor), db=D
 
 
 @router.delete("/drafts/{draft_id}/attachments/{attachment_id}")
-def remove_attachment(draft_id: str, attachment_id: str, revisionId: int, user=Depends(actor), db=Depends(get_db, scope="function")):
+def remove_attachment(draft_id: str, attachment_id: str, revisionId: int, request: Request, user=Depends(actor),
+                      db=Depends(get_db, scope="function")):
     row = own(db, user, "draft", draft_id, lock=True)
     revision(row, revisionId)
     mutable(row)
@@ -173,6 +179,7 @@ def remove_attachment(draft_id: str, attachment_id: str, revisionId: int, user=D
         fail(404, "NOT_FOUND", "附件不存在")
     db.delete(asset)
     row.change("draft", snapshot=None)
+    audit(db, user.org, user, "移除工单附件", row.id, request.state.request_id)
     db.flush()
     return view(db, user, row)
 
@@ -196,7 +203,7 @@ def confirm(draft_id: str, body: Revision, request: Request, user=Depends(actor)
                                  if ref.get(key) is not None} for ref in references],
                     attachments=[item.view() for item in attachments(db, user.org, row.id)])
     row.change("confirmed", snapshot=snapshot)
-    audit(db, user.org, user.key, "确认工单快照", row.id, request.state.request_id)
+    audit(db, user.org, user, "确认工单快照", row.id, request.state.request_id)
     return view(db, user, row)
 
 
@@ -212,7 +219,7 @@ def export(draft_id: str, body: Revision, request: Request, user=Depends(actor),
     snapshot = {**row.data["snapshot"]}
     current = {ref["id"] for ref in view(db, user, row)["references"]}
     snapshot["references"] = [ref for ref in snapshot["references"] if ref["id"] in current]
-    audit(db, user.org, user.key, "导出工单", row.id, request.state.request_id)
+    audit(db, user.org, user, "导出工单", row.id, request.state.request_id)
     return file_response(json.dumps(snapshot, ensure_ascii=False, indent=2).encode(), f"工单-{row.id[:8]}.json",
                          "application/json")
 
@@ -231,7 +238,7 @@ def register(draft_id: str, body: Register, request: Request, user=Depends(actor
         fail(409, "DUPLICATE_TICKET", "该外部单号已登记")
     add(db, user.org, "ticket", key=number.upper(), owner=row.id)
     row.change("linked", externalNumber=number)
-    audit(db, user.org, user.key, "登记外部工单号", row.id, request.state.request_id)
+    audit(db, user.org, user, "登记外部工单号", row.id, request.state.request_id)
     return view(db, user, row)
 
 
@@ -255,7 +262,7 @@ def submit(draft_id: str, body: Revision, request: Request, user=Depends(actor),
                      requestId=uid(), digest=digest(payload.encode()), payload=snapshot)
     row.change("submitting")
     enqueue(db, user.org, "submit", submission.id)
-    audit(db, user.org, user.key, "提交外部工单", row.id, request.state.request_id)
+    audit(db, user.org, user, "提交外部工单", row.id, request.state.request_id)
     return submission.view("payload")
 
 
@@ -274,6 +281,6 @@ def complete(draft_id: str, body: Revision, request: Request, user=Depends(actor
         fail(409, "LINK_REQUIRED", "请先关联外部工单")
     if not row.data.get("completedAt"):
         row.change(completedAt=now())
-        audit(db, user.org, user.key, "确认外部结单", row.id, request.state.request_id)
+        audit(db, user.org, user, "确认外部结单", row.id, request.state.request_id)
     return view(db, user, row)
 
