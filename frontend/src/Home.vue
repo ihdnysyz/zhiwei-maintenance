@@ -20,30 +20,10 @@ const summary = computed(() => [
   { title: '诊断会话', number: sessions.value.filter(row => row.sequence).length, icon: MessageSquare, theme: 'blue', to: '/ask', note: '可随时继续现场问答' },
   { title: '待确认工单', number: drafts.value.filter(row => row.status === 'draft').length, icon: ClipboardList, theme: 'amber', to: '/drafts', note: '核对现场处置后提交' },
 ])
-const faultExample = computed(() => {
-  if (store.profile?.demo) {
-    const source = sources.value.find(row => row.active && row.number === 'PUB-SIEMENS-G120C-FAULTS' && row.referenceUrl)
-    const device = source && store.devices.find(row => source.applicableDeviceId
-      ? row.id === source.applicableDeviceId
-      : row.model === source.model && row.batch === source.batch)
-    if (device) return {
-      title: 'F30005 是什么故障？', desc: '西门子 G120C · 核对厂家手册', icon: Search,
-      to: { path: '/ask', query: { device: device.id, q: 'F30005 是什么故障？' } },
-    }
-    const sample = store.devices.find(row => row.demo)
-    if (sample) return {
-      title: '演示样例 · E07 温度告警', desc: 'IM-200 · 查看内置示例', icon: Search,
-      to: { path: '/ask', query: { device: sample.id, q: 'E07 温度告警如何核对？' } },
-    }
-  }
-  return {
-    title: '查询设备故障码', desc: '查看适用手册和类似工单', icon: Search,
-    to: { path: '/ask', query: { q: '面板显示的故障码是' } },
-  }
-})
 const quick = computed(() => [
-  faultExample.value,
-  { title: '查找振动与异响案例', desc: '按现象定位历史处置经验', icon: Wrench, to: { path: '/ask', query: { q: '设备运行时有振动与异响，是否有类似历史案例？' } } },
+  ...(store.profile?.role === 'platform' && !store.devices.length
+    ? [{ title: '添加设备', desc: '先录入设备型号和批次，再导入适用资料', icon: Wrench, to: '/admin' }]
+    : [{ title: '查询设备故障码', desc: '选择设备后查找适用手册和类似工单', icon: Search, to: '/ask' }]),
   { title: '浏览维修资料', desc: '按手册、历史工单或案例筛选', icon: FileText, to: '/library' },
 ])
 const today = new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())

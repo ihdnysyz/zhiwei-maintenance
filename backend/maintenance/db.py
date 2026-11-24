@@ -233,6 +233,6 @@ def init_db():
             add(db, cfg.admin_org, "user", key="admin", status="active", name="平台管理员",
                 role="platform", password=password_hash(cfg.admin_password))
         if cfg.demo_mode:
-            from .seed import seed_demo
-            seed_demo(db)
+            from .seed import seed_demo_accounts
+            seed_demo_accounts(db)
 

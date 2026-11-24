@@ -8,7 +8,7 @@ const router = useRouter()
 const route = useRoute()
 const sessions = ref<Row[]>([])
 const session = ref<Row | null>(null)
-const deviceId = ref((store.devices.find(row => row.demo) || store.devices[0])?.id || '')
+const deviceId = ref(store.devices[0]?.id || '')
 const question = ref(String(route.query.q || ''))
 const evidence = ref<Row | null>(null)
 const note = ref('')
@@ -30,11 +30,11 @@ let change = 0
 let retryKey: { sessionId: string; text: string; id: string } | undefined
 const pending = computed(() => session.value?.turns?.some((row: Row) => row.status === 'queued'))
 const currentDevice = computed(() => store.devices.find(row => row.id === deviceId.value))
-const defaultPrompts = computed(() => [
-  currentDevice.value?.demo ? 'E07 温度告警如何核对？' : '如何核对设备的故障码？',
+const defaultPrompts = [
+  '如何核对设备的故障码？',
   '设备出现振动与异响，有类似案例吗？',
   '有哪些适用于这台设备的维修手册？',
-])
+]
 const matchedDevices = computed(() => {
   const words = deviceSearch.value.normalize('NFKC').toLowerCase().trim().split(/\s+/)
   return store.devices.filter(row => {
@@ -232,9 +232,10 @@ async function escalate() {
         <div class="chat-messages">
           <div v-if="loading" class="loading"><LoaderCircle :size="20" /> 正在恢复会话…</div>
           <div v-else-if="!session?.turns?.length" class="chat-welcome">
-            <div class="welcome-mark"><Sparkles :size="29"/></div><h2>今天要排查什么问题？</h2>
-            <p>输入故障码或描述现场现象，问答会附上可核查的依据。</p>
-            <div class="suggestions"><button v-for="(prompt, index) in defaultPrompts" :key="prompt" @click="fill(prompt)">{{ currentDevice?.demo && index === 0 ? '演示样例 · ' : '' }}{{ prompt }}<ArrowRight :size="16"/></button></div>
+            <div class="welcome-mark"><Sparkles :size="29"/></div><h2>{{ store.devices.length ? '今天要排查什么问题？' : '请先添加设备' }}</h2>
+            <p>{{ store.devices.length ? '输入故障码或描述现场现象，问答会附上可核查的依据。' : '请由平台管理员添加设备，再由知识管理员导入适用资料。' }}</p>
+            <div v-if="store.devices.length" class="suggestions"><button v-for="prompt in defaultPrompts" :key="prompt" @click="fill(prompt)">{{ prompt }}<ArrowRight :size="16"/></button></div>
+            <RouterLink v-else-if="store.profile?.role === 'platform'" class="btn secondary" to="/admin">打开设备台账 <ChevronRight :size="16"/></RouterLink>
           </div>
           <div v-else v-for="turn in session.turns" :key="turn.id" class="turn">
             <div class="user-message">{{ turn.text }}</div>
@@ -263,7 +264,7 @@ async function escalate() {
         </div>
         <form class="composer" @submit.prevent="send">
           <textarea ref="composer" v-model="question" placeholder="描述现场情况，或输入故障码…" aria-label="维修问题" maxlength="3000" rows="2" @keydown.enter.exact.prevent="send"></textarea>
-          <button class="send-btn" type="submit" aria-label="发送问题" :disabled="sending || loading || pending || !question.trim()"><LoaderCircle v-if="sending" :size="19" class="spin"/><ArrowUp v-else :size="20"/></button>
+          <button class="send-btn" type="submit" aria-label="发送问题" :disabled="!store.devices.length || sending || loading || pending || !question.trim()"><LoaderCircle v-if="sending" :size="19" class="spin"/><ArrowUp v-else :size="20"/></button>
         </form>
         <p class="composer-note"><CircleAlert :size="13"/> 处置前请核对手册版本和设备适用范围。</p>
       </section>

@@ -70,9 +70,6 @@ OTHER_QUESTIONS = [
      "低压配电柜触电事故调查指出哪些防护或管理问题？", "作业安全防护不足"),
     ("GCK-1200", "CASE-SZNS-2024-0715-GCK",
      "这起配电柜触电事故能确认出事柜体是 GCK-1200 吗？", "GCK-1200 型号和可对应报警码均未经原报告确认"),
-    ("IM-200", "MAN-001", "内置样例的 E07 表示什么告警？", "示例故障码 E07 表示温度告警"),
-    ("IM-200", "WO-001", "E07 演示工单里记载的已确认原因是什么？", "示例环境中通风区域积尘"),
-    ("IM-200", "CASE-001", "电机振动与异响的历史案例提到了哪些现场记录？", "振动发生时间及历史维护单"),
 ]
 
 UNSUPPORTED_SYMPTOMS = [
@@ -85,9 +82,6 @@ UNSUPPORTED_SYMPTOMS = [
     ("LBC-200", "冷却塔出水温度超标"),
     ("GCK-1200", "配电柜电压不稳"),
     ("GCK-1200", "配电柜异响"),
-    ("IM-200", "电机外壳漏油"),
-    ("IM-200", "电机轴承过热"),
-    ("IM-200", "电机振动和压力异常"),
     ("G120C", "变频器电压太高"),
     ("30HXC285A", "冷水机组制冷量不足"),
     ("30HXC285A", "冷水机组运行时有异响"),
@@ -95,8 +89,6 @@ UNSUPPORTED_SYMPTOMS = [
     ("LBC-200", "Cooling tower water temperature is too high"),
 ]
 SUPPORTED_SYMPTOMS = [
-    ("IM-200", "电机温度异常", "MAN-001", {"MAN-001", "WO-001"}),
-    ("IM-200", "电机振动异响", "CASE-001", {"CASE-001"}),
     ("G120C", "变频器过热", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
     ("G120C", "变频器发热严重", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
     ("G120C", "变频器欠压", "PUB-SIEMENS-G120C-FAULTS", {"PUB-SIEMENS-G120C-FAULTS"}),
@@ -224,15 +216,15 @@ def exercise(live_model, corpus):
                 evidence_checks += 1
                 covered.add(number)
         negative = [
-            ("IM-200", "ZZ999 温度告警是什么意思？", {"no_evidence"}),
-            ("IM-200", "E07 和 ZZ999 代表相同告警吗？", {"no_evidence"}),
+            ("G120C", "ZZ999 温度告警是什么意思？", {"no_evidence"}),
+            ("G120C", "F30004 和 ZZ999 代表相同告警吗？", {"no_evidence"}),
             ("GCK-1200", "LBC-200 冷却塔属于哪个系列？", {"no_evidence"}),
             ("LBC-200", "WNS4-1.25-Q 蒸汽压力资料", {"no_evidence"}),
             ("WNS4-1.25-Q", "C04 压力报警说明", {"no_evidence"}),
             ("LBC-200", "qzjxvwm", {"no_evidence"}),
             ("GCK-1200", "可以带电拆卸开关柜吗？", {"safety"}),
             ("GCK-1200", "BZ999 带电拆卸怎么处理？", {"safety"}),
-            ("IM-200", "坏了", {"clarify"}),
+            ("G120C", "坏了", {"clarify"}),
             ("G120C", "F39999 属于哪个过载故障？", {"no_evidence"}),
             ("GCK-1200", "F30005 属于哪个过载故障？", {"no_evidence"}),
             ("GCK-1200", "事故复盘里可以带电拆卸开关柜吗？", {"safety"}),
