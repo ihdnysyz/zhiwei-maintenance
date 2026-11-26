@@ -168,18 +168,24 @@ function markDone() { return modify(async () => {
         </section>
       </aside>
     </div>
-    <div v-if="confirmOpen || selectedRef" class="backdrop" @click="confirmOpen = false; selectedRef = null"></div>
-    <dialog v-if="confirmOpen && draft" open class="modal" aria-label="现场工单确认">
-      <div class="sheet-head"><h2>确认现场处置</h2><button class="icon-btn" aria-label="取消" @click="confirmOpen = false"><X :size="22"/></button></div>
-      <div class="sheet-body form-stack"><p class="muted">请核对设备、实测原因、实际处置和结果。确认后保存当前快照。</p>
-        <dl class="preview-fields"><dt>外部工单号</dt><dd>{{ contractNumber }}</dd><dt>设备</dt><dd>{{ draft.device.number }} · {{ draft.device.name }}</dd><template v-for="(label,key) in fieldNames" :key="key"><dt>{{ label }}</dt><dd>{{ fields[key] || '未填写' }}</dd></template></dl>
-        <p v-if="err" class="error" role="alert">{{ err }}</p><div class="button-row"><button class="btn secondary" @click="confirmOpen = false">返回编辑</button><button class="btn primary" :disabled="busy" @click="approve"><Check :size="17"/> 确认现场记录</button></div>
-      </div>
-    </dialog>
-    <dialog v-if="selectedRef" open class="sheet" aria-label="工单引用">
-      <div class="sheet-head"><div><p class="eyebrow">{{ selectedRef.position }} · V{{ selectedRef.version }}</p><h2>{{ selectedRef.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="selectedRef = null"><X :size="22"/></button></div>
-      <div class="sheet-body"><div class="document-text">{{ selectedRef.text }}</div></div>
-    </dialog>
+    <Transition name="scrim">
+      <div v-if="confirmOpen || selectedRef" class="backdrop" @click="confirmOpen = false; selectedRef = null"></div>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="confirmOpen && draft" open class="modal" aria-label="现场工单确认" @keydown.esc="confirmOpen = false">
+        <div class="sheet-head"><h2>确认现场处置</h2><button class="icon-btn" aria-label="取消" @click="confirmOpen = false"><X :size="22"/></button></div>
+        <div class="sheet-body form-stack"><p class="muted">请核对设备、实测原因、实际处置和结果。确认后保存当前快照。</p>
+          <dl class="preview-fields"><dt>外部工单号</dt><dd>{{ contractNumber }}</dd><dt>设备</dt><dd>{{ draft.device.number }} · {{ draft.device.name }}</dd><template v-for="(label,key) in fieldNames" :key="key"><dt>{{ label }}</dt><dd>{{ fields[key] || '未填写' }}</dd></template></dl>
+          <p v-if="err" class="error" role="alert">{{ err }}</p><div class="button-row"><button class="btn secondary" @click="confirmOpen = false">返回编辑</button><button class="btn primary" :disabled="busy" @click="approve"><Check :size="17"/> 确认现场记录</button></div>
+        </div>
+      </dialog>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="selectedRef" v-sheet-drag="() => { selectedRef = null }" open class="sheet" aria-label="工单引用" @keydown.esc="selectedRef = null">
+        <div class="sheet-head"><div><p class="eyebrow">{{ selectedRef.position }} · V{{ selectedRef.version }}</p><h2>{{ selectedRef.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="selectedRef = null"><X :size="22"/></button></div>
+        <div class="sheet-body"><div class="document-text">{{ selectedRef.text }}</div></div>
+      </dialog>
+    </Transition>
   </main>
 </template>
 

@@ -10,9 +10,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from .common import actor, device_for, fail, get_db, need, own, permitted_device, revision
-from .conversations import active_session, session_turns, turn_view
+from .conversations import active_session, question_context, session_turns, turn_view
 from .db import Record, add, audit, audit_events, cfg, digest, enqueue, find, now, records, uid
-from .knowledge import applicability, fault_codes
+from .knowledge import applicability, code_key, fault_codes, symptom_signals
 from .library import WORKORDER_CASE_VERSION, file_response, workorder_case_number
 
 router = APIRouter()
@@ -130,12 +130,20 @@ def create(body: DraftCreate, request: Request, user=Depends(actor), db=Depends(
         return view(db, user, existing)
     last = turns[-1]
     symptom = "\n".join(row.data["text"] for row in turns)[-8000:]
-    codes = fault_codes(last.data["text"], device)
-    fault = next(iter(codes)) if len(codes) == 1 else ""
+    last_codes = fault_codes(last.data["text"], device)
+    context_start = last.data.get("contextStart")
+    if context_start is None:
+        previous, _, _ = question_context(turns[:-1], last.data["text"],
+                                          last_codes or symptom_signals(last.data["text"]))
+        context_start = previous[0].data["sequence"] if previous else last.data["sequence"]
+    context_codes = {code_key(code): code for turn in turns if turn.data["sequence"] >= context_start
+                     for code in fault_codes(turn.data["text"], device)}
+    fault = next(iter(context_codes.values())) if len(context_codes) == 1 else ""
+    fault_origin = ("最近一轮现场描述" if last_codes else "当前诊断上下文") if fault else ""
     fields = {"symptom": symptom, "faultCode": fault, "cause": "", "actions": "", "result": ""}
     row = add(db, user.org, "draft", key=session.id, owner=user.key, status="draft", sessionId=session.id,
               turnId=last.id, device={key: device[key] for key in ("id", "name", "number", "model", "batch", "location")},
-              fields=fields, origins={"symptom": "会话现场描述", "faultCode": "最近一轮现场描述" if fault else "",
+              fields=fields, origins={"symptom": "会话现场描述", "faultCode": fault_origin,
                                      "device": "设备台账"}, changes=[], snapshot=None)
     audit(db, user.org, user, "生成工单草稿", row.id, request.state.request_id)
     return view(db, user, row)

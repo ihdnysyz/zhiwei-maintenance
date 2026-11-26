@@ -206,8 +206,9 @@ def exercise(live_model, corpus):
                 continue
             _, _, turn = answer(client, device_id, question)
             citations = turn.get("citations", [])
-            actual = turn["answer"] if live_model else "\n".join(row["text"] for row in citations)
-            if turn["decision"] != ("answer" if live_model else "evidence") or expected not in actual:
+            actual = turn["answer"] if turn["decision"] == "answer" else "\n".join(row["text"] for row in citations)
+            decisions = {"answer"} if live_model else {"answer", "evidence"}
+            if turn["decision"] not in decisions or expected not in actual:
                 failures.append((turn["decision"], question))
             elif not any(row["sourceId"] == source["id"] and row["referenceUrl"] == source.get("referenceUrl")
                          and expected in row["text"] for row in citations):

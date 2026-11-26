@@ -7,8 +7,9 @@ from sqlalchemy import delete, or_, select, text
 
 from .common import permitted_device
 from .conversations import answer_turn, expert_task
-from .db import DB, Chunk, Job, add, audit, cfg, find, init_db, set_org, timestamp, uid
-from .knowledge import embeddings, parse_file, split_blocks
+from .db import DB, Chunk, FaultIndex, Job, add, audit, cfg, find, init_db, set_org, timestamp, uid
+from .knowledge import embeddings, fault_index_entries, parse_file, split_blocks
+from .library import apply_publication_scope
 
 log = logging.getLogger("maintenance.worker")
 
@@ -109,7 +110,8 @@ def finish_external(db, job, result):
 def parse_source(job):
     with DB() as db:
         row = find(db, job.org, "source", id=job.target)
-        document = list(split_blocks(parse_file(row.data["filename"], row.blob, row.data["category"])))
+        category = row.data["category"]
+        document = list(split_blocks(parse_file(row.data["filename"], row.blob, category), category))
     if not document:
         raise ValueError("没有可校核的文字")
     vectors = [None] * len(document)
@@ -149,14 +151,26 @@ def run(job):
                 if row and row.status == "queued":
                     set_org(db, job.org)
                     document, vectors, degraded = result
+                    db.execute(delete(FaultIndex).where(FaultIndex.org == job.org, FaultIndex.source == row.id))
                     db.execute(delete(Chunk).where(Chunk.org == job.org, Chunk.source == row.id))
+                    codes = []
                     for (position, body, ocr), vector in zip(document, vectors):
-                        db.add(Chunk(org=job.org, source=row.id, position=position, body=body, ocr=ocr,
+                        chunk_id = uid()
+                        db.add(Chunk(id=chunk_id, org=job.org, source=row.id, position=position, body=body, ocr=ocr,
                                      embedding=vector, embedding_model=cfg.embedding_model if vector is not None else ""))
+                        codes.extend(fault_index_entries(job.org, row.id, chunk_id, position, body))
+                    if codes:
+                        db.execute(FaultIndex.__table__.insert(), codes)
                     case_review = row.data.get("category") == "case" and bool(row.data.get("workorderLocator"))
-                    row.change("review" if case_review else "calibration", indexReady=True, chunkCount=len(document),
-                               ocr=any(item[2] for item in document), keywordOnly=degraded)
-                    label = "案例校验完成，已送独立审核" if case_review else "资料解析完成，等待校核"
+                    fields = dict(indexReady=True, chunkCount=len(document), ocr=any(item[2] for item in document),
+                                  keywordOnly=degraded)
+                    if row.data.get("publishOnParse") and not case_review:
+                        row.change(approvedDigest=row.data["digest"], **fields)
+                        apply_publication_scope(db, row, until_scheduled=True)
+                        label = "资料解析完成，已自动生效"
+                    else:
+                        row.change("review" if case_review else "calibration", **fields)
+                        label = "案例校验完成，已送独立审核" if case_review else "资料解析完成，等待校核"
                     audit(db, job.org, "worker", label, row.id, job.id)
             elif job.kind == "turn":
                 row = find(db, job.org, "turn", id=job.target)

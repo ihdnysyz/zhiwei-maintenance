@@ -1,0 +1,20 @@
+[
+  {
+    "number": "PUB-SIEMENS-G120C-FAULTS",
+    "version": "1.3",
+    "title": "西门子 SINAMICS G120C FSD–FSF 故障码与排查步骤",
+    "category": "manual",
+    "model": "G120C",
+    "batch": "FSD-FSF / V4.7 SP6",
+    "referenceUrl": "https://support.industry.siemens.com/cs/attachments/109744756/G120C_FSD_F_cmpct_op_instr_1116_zh-CHS.pdf#page=96"
+  },
+  {
+    "number": "PUB-GRUNDFOS-CR15-TROUBLESHOOT",
+    "version": "1.0",
+    "title": "格兰富 CR 15 水泵故障排查 · 厂家手册整理",
+    "category": "manual",
+    "model": "CR 15",
+    "batch": "50/60 Hz IEC",
+    "referenceUrl": "https://api.grundfos.com/literature/Grundfosliterature-6012970.pdf#page=36"
+  }
+]

@@ -9,15 +9,16 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 import httpx
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 
 from .common import actor, device_for, fail, get_db, need, permitted_device, revision, role
-from .db import Chunk, Record, Scope, add, audit, audit_events, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
-from .knowledge import KINDS, applicability, authorized_citation, embeddings, model_approval_endpoint, retrieve
+from .db import Chunk, FaultIndex, Record, Scope, add, audit, audit_events, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
+from .knowledge import KINDS, applicability, authorized_citation, embeddings, fault_index_entries, model_approval_endpoint, retrieve
 
 router = APIRouter()
 CONTENT_TYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                 "txt": "text/plain; charset=utf-8", "md": "text/plain; charset=utf-8", "csv": "text/plain; charset=utf-8"}
+                 "txt": "text/plain; charset=utf-8", "md": "text/plain; charset=utf-8",
+                 "csv": "text/csv", "tsv": "text/tab-separated-values"}
 WORKORDER_CASE_VERSION = "1.0"
 
 
@@ -46,7 +47,7 @@ class ImportInfo(BaseModel):
 class SourceAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     revision: int
-    action: Literal["review", "approve", "reject", "publish", "block"]
+    action: Literal["review", "approve", "reject", "publish", "block", "authorize_model"]
     verified: bool = False
     allowExternalModel: bool = False
     note: str = Field(default="", max_length=1500)
@@ -68,7 +69,13 @@ class Calibration(BaseModel):
     text: str = Field(min_length=1, max_length=80000)
 
 
-def queue_source(db, org, owner, info, filename, body):
+class SourceTrial(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    deviceId: str
+    question: str = Field(min_length=1, max_length=3000)
+
+
+def queue_source(db, org, owner, info, filename, body, *, publish_on_parse=False):
     key = f"{info['number']}:{info['version']}"
     exists = find(db, org, "source", key=key)
     summary = digest(body + json.dumps(info, sort_keys=True, ensure_ascii=False).encode())
@@ -80,23 +87,35 @@ def queue_source(db, org, owner, info, filename, body):
     if not find(db, org, "family", key=info["number"]):
         add(db, org, "family", key=info["number"])
     record = add(db, org, "source", owner=owner, key=key, status="queued", **info, filename=filename,
-                 digest=summary, importDigest=summary, indexReady=False, blob=body)
+                 digest=summary, importDigest=summary, indexReady=False, publishOnParse=publish_on_parse, blob=body)
     enqueue(db, org, "parse", record.id)
     return record, "queued"
 
 
 @router.get("/sources")
-def list_sources(user=Depends(actor), db=Depends(get_db, scope="function")):
+def list_sources(deviceId: str = "", user=Depends(actor), db=Depends(get_db, scope="function")):
     can_manage = user.data["role"] in {"library", "expert"}
+    selected = device_for(db, user, deviceId) if deviceId else None
     sources = list(db.scalars(records(user.org, "source").order_by(Record.updated.desc())))
     if can_manage:
-        active = {scope.source for scope in db.scalars(current_scopes(user.org).where(Scope.status == "bind"))}
+        if selected:
+            active, _ = applicability(db, user.org, selected)
+            # Keep pending items visible for calibration and review in the declared scope.
+            sources = [row for row in sources if row.id in active or (
+                row.status in {"queued", "calibration", "review", "approved", "returned", "failed"}
+                and row.data["model"] in {"*", selected["model"]}
+                and row.data.get("batch", "") in {"", selected.get("batch", "")})]
+        else:
+            active = {scope.source for scope in db.scalars(current_scopes(user.org).where(Scope.status == "bind"))}
         return [{**row.view("digest", "approvedModelEndpoint"), "active": row.id in active}
                 for row in sources if permitted_device(user, row.data)]
     active, devices = {}, {}
-    for row in db.scalars(records(user.org, "device").order_by(Record.key)):
-        if permitted_device(user, row.data):
-            devices.setdefault((row.data["model"], row.data["batch"]), row.id)
+    if selected:
+        devices[(selected["model"], selected["batch"])] = selected["id"]
+    else:
+        for row in db.scalars(records(user.org, "device").order_by(Record.key)):
+            if permitted_device(user, row.data):
+                devices.setdefault((row.data["model"], row.data["batch"]), row.id)
     for (model, batch), device_id in devices.items():
         applicable, _ = applicability(db, user.org, {"model": model, "batch": batch})
         for source_id in applicable:
@@ -131,7 +150,7 @@ def import_sources(request: Request, files: Annotated[list[UploadFile], File()],
         if not raw or len(raw) > cfg.max_upload_mib * 1024 * 1024:
             items.append(dict(filename=filename, status="failed", error=f"文件为空或超过 {cfg.max_upload_mib} MiB"))
             continue
-        row, status = queue_source(db, user.org, user.key, info, filename, raw)
+        row, status = queue_source(db, user.org, user.key, info, filename, raw, publish_on_parse=True)
         items.append(dict(filename=filename, sourceId=row.id, status=status))
         if status in {"queued", "conflict"}:
             audit(db, user.org, user, "导入资料" if status == "queued" else "发现资料版本冲突", row.id, request.state.request_id)
@@ -190,7 +209,7 @@ def retry_import(batch_id: str, request: Request, user=Depends(actor), db=Depend
         if item["status"] == "queued":
             row = find(db, user.org, "source", id=item["sourceId"], lock=True)
             if row and row.status == "failed" and permitted_device(user, row.data):
-                row.change("queued", error="")
+                row.change("queued", error="", publishOnParse=True)
                 enqueue(db, user.org, "parse", row.id)
                 audit(db, user.org, user, "重新解析资料", row.id, request.state.request_id)
                 retried = True
@@ -214,7 +233,7 @@ def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
             fail(409, "VERSION_EXISTS", "请输入尚未使用的新版本")
         info = {key: row.data[key] for key in ImportInfo.model_fields if key in row.data}
         info["version"] = body.version
-        source, _ = queue_source(db, user.org, user.key, info, row.data["filename"], row.blob)
+        source, _ = queue_source(db, user.org, user.key, info, row.data["filename"], row.blob, publish_on_parse=True)
         row.change("resolved", replacementId=source.id)
         audit(db, user.org, user, "按新版本导入资料", source.id, request.state.request_id)
     else:
@@ -240,12 +259,41 @@ def get_source(source_id: str, deviceId: str = "", user=Depends(actor), db=Depen
     active = db.scalar(current_scopes(user.org).where(Scope.source == row.id, Scope.status == "bind").limit(1)) is not None
     if manager:
         host, endpoint_key = model_approval_endpoint()
+        codes = select(FaultIndex.code).where(FaultIndex.org == user.org, FaultIndex.source == row.id).distinct()
+        declared_codes = codes.where(FaultIndex.declared.is_(True))
+        declared_count = db.scalar(select(func.count()).select_from(declared_codes.subquery()))
         fields = {**row.view("digest", "approvedModelEndpoint"), "modelApprovalHost": host,
                   "externalModelApproved": bool(endpoint_key and endpoint_key == row.data.get("approvedModelEndpoint")),
+                  "indexedCodeCount": db.scalar(select(func.count()).select_from(codes.subquery())),
+                  "declaredCodeCount": declared_count,
+                  "indexedCodeExamples": list(db.scalars((declared_codes if declared_count else codes)
+                                                         .order_by(FaultIndex.code).limit(12))),
                   "operationHistory": audit_events(db, user.org, [row.id, *(chunk.id for chunk in chunks)])}
     else:
         fields = row.view("digest", "reviewer", "verifiedBy", "note", "approvedDigest", "approvedModelEndpoint")
     return {**fields, "active": active, "chunks": [chunk.view() for chunk in chunks], "scopes": history}
+
+
+@router.post("/sources/{source_id}/trial")
+def source_trial(source_id: str, body: SourceTrial,
+                 user=Depends(actor), db=Depends(get_db, scope="function")):
+    from .conversations import answer_question
+
+    role(user, "library", "expert")
+    source = need(find(db, user.org, "source", id=source_id))
+    if not permitted_device(user, source.data):
+        fail(403, "SCOPE_DENIED", "资料超出设备范围")
+    if not source.data.get("indexReady"):
+        fail(409, "INDEX_NOT_READY", "请等待资料解析完成")
+    device = device_for(db, user, body.deviceId)
+    model, batch = source.data["model"], source.data.get("batch")
+    if model not in {"*", device["model"]} or (batch and batch != device.get("batch")):
+        return dict(decision="out_of_scope", answer="所选设备的型号或批次不在这份资料的适用范围内。",
+                    hits=[], referenceIds=[], requestedCodes=[], availableInAsk=False)
+    applicable, ambiguous = applicability(db, user.org, device)
+    result = answer_question(db, user.org, user, device, body.question, preview_source=source)
+    result.pop("_conflictDevice", None)
+    return {**result, "availableInAsk": not ambiguous and source.id in applicable}
 
 
 @router.get("/knowledge/search")
@@ -272,6 +320,10 @@ def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request
     if target.body == body.text:
         return row.view("digest", "importDigest")
     target.body = body.text
+    db.execute(delete(FaultIndex).where(FaultIndex.org == user.org, FaultIndex.source == row.id, FaultIndex.chunk == target.id))
+    codes = fault_index_entries(user.org, row.id, target.id, target.position, target.body)
+    if codes:
+        db.execute(FaultIndex.__table__.insert(), codes)
     target.embedding = None
     target.embedding_model = ""
     keyword_only = row.data.get("keywordOnly", False)
@@ -300,11 +352,11 @@ def parse_date(value):
         fail(422, "INVALID_DATE", "生效时间需要带时区")
 
 
-def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", batch_override=None):
+def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", batch_override=None, until_scheduled=False):
     data = source.data
     org = source.org
     if not data.get("indexReady") or data.get("approvedDigest") != data.get("digest"):
-        fail(409, "INDEX_REQUIRED", "已审核摘要或索引尚未就绪")
+        fail(409, "INDEX_REQUIRED", "资料索引或生效摘要尚未就绪")
     need(find(db, org, "family", key=data["number"], lock=True))
     current_time = datetime.now(timezone.utc)
     start = parse_date(start_at) if start_at else current_time
@@ -314,9 +366,10 @@ def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", ba
     batch = data["batch"]
     if not bind and not batch and batch_override is not None:
         batch = batch_override.strip()
-    matching = scopes(org).where(Scope.number == data["number"],
-                                 Scope.model == data["model"], Scope.batch == batch,
-                                 (Scope.end.is_(None) | (Scope.end > start)))
+    matching = scopes(org).where(Scope.number == data["number"], Scope.model == data["model"], Scope.batch == batch)
+    if until_scheduled:
+        end = db.scalar(matching.with_only_columns(func.min(Scope.start)).where(Scope.start > start))
+    matching = matching.where(Scope.end.is_(None) | (Scope.end > start))
     if end:
         matching = matching.where(Scope.start < end)
     for scope in db.scalars(matching.with_for_update()):
@@ -331,14 +384,14 @@ def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", ba
 
 @router.post("/sources/{source_id}/actions")
 def action(source_id: str, body: SourceAction, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "expert" if body.action in {"approve", "reject"} else "library")
+    role(user, "expert" if body.action in {"approve", "reject", "authorize_model"} else "library")
     source = need(find(db, user.org, "source", id=source_id, lock=True))
     revision(source, body.revision)
     data = source.data
     if not permitted_device(user, data):
         fail(403, "SCOPE_DENIED", "资料超出设备范围")
     if body.allowExternalModel and body.action != "approve":
-        fail(422, "MODEL_APPROVAL_ACTION", "请在独立审核通过时授权回答模型")
+        fail(422, "MODEL_APPROVAL_ACTION", "请使用对应的回答模型授权操作")
     if body.action == "review" and source.status in {"calibration", "returned"}:
         if not body.verified:
             fail(422, "CALIBRATION_REQUIRED", "请先核对片段、故障码、关键数值和原图")
@@ -357,9 +410,17 @@ def action(source_id: str, body: SourceAction, request: Request, user=Depends(ac
     elif body.action in {"publish", "block"} and source.status in {"approved", "published", "withdrawn"}:
         apply_publication_scope(db, source, bind=body.action == "publish", start_at=body.start,
                                 end_at=body.end, batch_override=body.batch)
+    elif body.action == "authorize_model" and source.status == "published" and data.get("publishOnParse"):
+        if user.key == source.owner:
+            fail(403, "INDEPENDENT_REVIEW", "请由独立专家授权回答模型")
+        endpoint_key = model_approval_endpoint()[1]
+        if not endpoint_key:
+            fail(409, "MODEL_APPROVAL_DISABLED", "当前未启用按资料授权的回答模型")
+        source.change(approvedModelEndpoint=endpoint_key)
     else:
         fail(409, "SOURCE_STATE", "当前资料状态不支持此操作")
-    audit(db, user.org, user, "资料·" + body.action, source.id, request.state.request_id)
+    event = "资料·授权回答模型" if body.action == "authorize_model" else "资料·" + body.action
+    audit(db, user.org, user, event, source.id, request.state.request_id)
     if body.allowExternalModel:
         audit(db, user.org, user, "资料·授权回答模型", source.id, request.state.request_id)
     if body.action == "approve" and data["category"] == "case" and data.get("workorderLocator"):

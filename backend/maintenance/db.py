@@ -8,7 +8,7 @@ from uuid import uuid4
 from pgvector.sqlalchemy import Vector
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, event, select, text
+from sqlalchemy import JSON, Boolean, DateTime, Float, Index, Integer, LargeBinary, String, Text, UniqueConstraint, create_engine, event, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     embedding_dimensions: int = 0
     embedding_min_similarity: float = 0.48
     rrf_k: int = 60
+    rag_trace: bool = False
     allow_model_data: bool = False
     model_demo_only: bool = False
     model_demo_source_ids: str = ""
@@ -126,6 +127,16 @@ class Chunk(Base):
 
     def view(self):
         return dict(id=self.id, position=self.position, text=self.body, ocr=self.ocr)
+
+
+class FaultIndex(Base):
+    __tablename__ = "fault_index"
+    __table_args__ = (Index("ix_fault_index_lookup", "org", "code", "source"),)
+    org: Mapped[str] = mapped_column(String(80), primary_key=True)
+    source: Mapped[str] = mapped_column(String(32), primary_key=True)
+    chunk: Mapped[str] = mapped_column(String(32), primary_key=True)
+    code: Mapped[str] = mapped_column(String(24), primary_key=True)
+    declared: Mapped[bool] = mapped_column(Boolean)
 
 
 class Job(Base):

@@ -59,6 +59,7 @@ function openCase(row: Row) {
   record.value = row
   note.value = [
     '适用设备：' + row.device.model + (row.device.batch ? ' / ' + row.device.batch : ''),
+    ...(row.fields.faultCode ? ['故障码：' + row.fields.faultCode] : []),
     '现象：' + row.fields.symptom, '确认原因：' + row.fields.cause,
     '实际处置：' + row.fields.actions, '结果：' + row.fields.result,
   ].join('\n')
@@ -106,30 +107,38 @@ async function sendCase() {
         <template v-else><button v-for="row in completed" :key="row.id" class="source-row" @click="openCase(row)"><span class="tile-icon amber"><ClipboardCheck :size="20"/></span><span class="source-main"><b>{{ row.fields.symptom }}</b><small>{{ row.externalNumber }} · {{ row.device.model }}</small></span><span class="pill">{{ row.caseSource ? (row.caseSource.active ? '案例已生效' : '案例 · ' + (row.caseSource.status === 'published' ? '未生效' : statuses[row.caseSource.status])) : '整理案例' }}</span><ChevronRight :size="17"/></button></template>
       </template>
     </section>
-    <div v-if="selected || record || caseSourceId" class="backdrop" @click="selected = null; record = null; caseSourceId = null"></div>
-    <SourceDetail v-if="caseSourceId" :key="caseSourceId" :source-id="caseSourceId" @close="caseSourceId = null" @updated="loadCases"/>
-    <dialog v-if="selected" open class="sheet" aria-label="专家待办">
-      <div class="sheet-head"><div><p class="eyebrow">{{ selected.deviceName }} · {{ statuses[selected.status] }}</p><h2>{{ selected.title }}</h2></div><button class="icon-btn" aria-label="关闭待办" @click="selected = null"><X :size="22"/></button></div>
-      <div class="sheet-body form-stack">
-        <p v-if="selected.assignee" class="muted">经办专家 · {{ selected.assignee }}</p>
-        <div v-if="selected.note" class="document-text">{{ selected.note }}</div>
-        <p v-if="selected.turn?.answer">{{ selected.turn.answer }}</p>
-        <details v-for="item in selected.turn?.citations || []" :key="item.id" class="doc-section"><summary><BookOpen :size="15" class="inline-icon"/> {{ item.title }} · {{ item.position }}</summary><p class="document-text">{{ item.text }}</p></details>
-        <div v-if="selected.reply" class="document-text"><b>专家答复</b><p>{{ selected.reply }}</p></div>
-        <button v-if="expert && selected.status === 'open'" class="btn primary own-width" @click="action('claim')">领取待办</button>
-        <form v-if="expert && ['open','assigned'].includes(selected.status) && (!selected.assignee || selected.assignee === store.profile?.username)" class="form-stack" @submit.prevent="action('assign')"><label>分派给其他专家<input v-model="assignee" placeholder="组织内专家账号" required/></label><button class="btn secondary own-width" :disabled="busy">确认分派</button></form>
-        <template v-if="expert && selected.assignee === store.profile?.username && selected.status !== 'open'">
-          <label>答复或知识修订内容<textarea v-model="note" rows="5" maxlength="4000"/></label>
-          <div class="button-row"><button v-if="['assigned','answered'].includes(selected.status)" class="btn primary" :disabled="busy || !note.trim()" @click="action('reply')">保存答复</button><button v-if="selected.status === 'answered'" class="btn secondary" :disabled="busy" @click="action('close')">关闭待办</button><button v-if="['answered','closed'].includes(selected.status) && !selected.revisionCandidate" class="btn secondary" :disabled="busy || !note.trim()" @click="action('revise')">提交知识修订</button></div>
-        </template>
-        <p v-if="error" class="error" role="alert">{{ error }}</p>
-        <OperationHistory :events="selected.operationHistory"/>
-      </div>
-    </dialog>
-    <dialog v-if="record" open class="modal" aria-label="整理回流案例">
-      <div class="sheet-head"><div><p class="eyebrow">{{ record.externalNumber }}</p><h2>整理回流案例</h2></div><button class="icon-btn" aria-label="取消" @click="record = null"><X :size="22"/></button></div>
-      <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。校验完成后将自动送审。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校验</button></div><OperationHistory :events="record.operationHistory"/></form>
-    </dialog>
+    <Transition name="scrim">
+      <div v-if="selected || record || caseSourceId" class="backdrop" @click="selected = null; record = null; caseSourceId = null"></div>
+    </Transition>
+    <Transition name="overlay">
+      <SourceDetail v-if="caseSourceId" :key="caseSourceId" :source-id="caseSourceId" @close="caseSourceId = null" @updated="loadCases"/>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="selected" v-sheet-drag="() => { selected = null }" open class="sheet" aria-label="专家待办" @keydown.esc="selected = null">
+        <div class="sheet-head"><div><p class="eyebrow">{{ selected.deviceName }} · {{ statuses[selected.status] }}</p><h2>{{ selected.title }}</h2></div><button class="icon-btn" aria-label="关闭待办" @click="selected = null"><X :size="22"/></button></div>
+        <div class="sheet-body form-stack">
+          <p v-if="selected.assignee" class="muted">经办专家 · {{ selected.assignee }}</p>
+          <div v-if="selected.note" class="document-text">{{ selected.note }}</div>
+          <p v-if="selected.turn?.answer">{{ selected.turn.answer }}</p>
+          <details v-for="item in selected.turn?.citations || []" :key="item.id" class="doc-section"><summary><BookOpen :size="15" class="inline-icon"/> {{ item.title }} · {{ item.position }}</summary><p class="document-text">{{ item.text }}</p></details>
+          <div v-if="selected.reply" class="document-text"><b>专家答复</b><p>{{ selected.reply }}</p></div>
+          <button v-if="expert && selected.status === 'open'" class="btn primary own-width" @click="action('claim')">领取待办</button>
+          <form v-if="expert && ['open','assigned'].includes(selected.status) && (!selected.assignee || selected.assignee === store.profile?.username)" class="form-stack" @submit.prevent="action('assign')"><label>分派给其他专家<input v-model="assignee" placeholder="组织内专家账号" required/></label><button class="btn secondary own-width" :disabled="busy">确认分派</button></form>
+          <template v-if="expert && selected.assignee === store.profile?.username && selected.status !== 'open'">
+            <label>答复或知识修订内容<textarea v-model="note" rows="5" maxlength="4000"/></label>
+            <div class="button-row"><button v-if="['assigned','answered'].includes(selected.status)" class="btn primary" :disabled="busy || !note.trim()" @click="action('reply')">保存答复</button><button v-if="selected.status === 'answered'" class="btn secondary" :disabled="busy" @click="action('close')">关闭待办</button><button v-if="['answered','closed'].includes(selected.status) && !selected.revisionCandidate" class="btn secondary" :disabled="busy || !note.trim()" @click="action('revise')">提交知识修订</button></div>
+          </template>
+          <p v-if="error" class="error" role="alert">{{ error }}</p>
+          <OperationHistory :events="selected.operationHistory"/>
+        </div>
+      </dialog>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="record" open class="modal" aria-label="整理回流案例" @keydown.esc="record = null">
+        <div class="sheet-head"><div><p class="eyebrow">{{ record.externalNumber }}</p><h2>整理回流案例</h2></div><button class="icon-btn" aria-label="取消" @click="record = null"><X :size="22"/></button></div>
+        <form class="sheet-body form-stack" @submit.prevent="sendCase"><p class="muted">核对适用条件、处置过程和结果，并移除人员姓名、联系方式等可识别信息。校验完成后将自动送审。</p><label>脱敏后的案例<textarea v-model="note" rows="9" required minlength="20" maxlength="16000"/></label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="busy">送知识库校验</button></div><OperationHistory :events="record.operationHistory"/></form>
+      </dialog>
+    </Transition>
   </main>
 </template>
 

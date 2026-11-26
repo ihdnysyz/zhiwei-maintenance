@@ -30,11 +30,6 @@ let change = 0
 let retryKey: { sessionId: string; text: string; id: string } | undefined
 const pending = computed(() => session.value?.turns?.some((row: Row) => row.status === 'queued'))
 const currentDevice = computed(() => store.devices.find(row => row.id === deviceId.value))
-const defaultPrompts = [
-  '如何核对设备的故障码？',
-  '设备出现振动与异响，有类似案例吗？',
-  '有哪些适用于这台设备的维修手册？',
-]
 const matchedDevices = computed(() => {
   const words = deviceSearch.value.normalize('NFKC').toLowerCase().trim().split(/\s+/)
   return store.devices.filter(row => {
@@ -42,13 +37,28 @@ const matchedDevices = computed(() => {
     return words.every(word => description.includes(word))
   })
 })
-const safeScroll = () => nextTick(() => bottom.value?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }))
+const safeScroll = () => nextTick(() => {
+  const messages = bottom.value?.parentElement
+  if (!messages) return
+  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  messages.scrollTo({ top: messages.scrollHeight, behavior: reduceMotion ? 'instant' : 'smooth' })
+})
 async function history() { sessions.value = (await api<Row[]>('/sessions')).filter(row => !removedIds.has(row.id)) }
+function resetSession() {
+  ++change
+  clearTimeout(timer)
+  session.value = null
+  retryKey = undefined
+  evidence.value = null
+  escalateTurn.value = null
+  loading.value = false
+}
 onMounted(() => history().catch(error => notice(errorMessage(error), true)))
 onUnmounted(() => { active = false; clearTimeout(timer) })
 watch(() => [route.params.id, route.query.q, route.query.device], async ([id, query, requestedDevice]) => {
   const generation = ++change
   clearTimeout(timer)
+  retryKey = undefined
   evidence.value = null
   escalateTurn.value = null
   if (query) question.value = String(query)
@@ -96,11 +106,12 @@ function poll() {
 }
 async function selectDevice(row: Row) {
   pickDevice.value = false
-  if (deviceId.value === row.id) return
+  if (sending.value || deviceId.value === row.id) return
+  const hadSession = !!session.value || !!route.params.id
+  resetSession()
   deviceId.value = row.id
-  evidence.value = null
-  if (session.value) {
-    await router.push('/ask')
+  if (hadSession) {
+    if (route.fullPath !== '/ask') await router.push('/ask')
     notice('已切换设备，新的提问将创建诊断会话')
   } else if (route.query.device) {
     if (question.value === route.query.q) question.value = ''
@@ -116,19 +127,27 @@ async function send() {
   const text = question.value.trim()
   if (!text || sending.value || loading.value || pending.value) return
   if (!deviceId.value) { pickDevice.value = true; return }
+  if (session.value && session.value.deviceId !== deviceId.value) resetSession()
+  const generation = change
+  const selectedDevice = deviceId.value
   sending.value = true
   try {
     let row = session.value
     if (!row) {
-      row = await api<Row>('/sessions', 'POST', { deviceId: deviceId.value })
+      row = await api<Row>('/sessions', 'POST', { deviceId: selectedDevice })
+      if (!active || generation !== change) return
       session.value = { ...row, turns: [] }
     }
     if (!retryKey || retryKey.sessionId !== row.id || retryKey.text !== text) {
       retryKey = { sessionId: row.id, text, id: crypto.randomUUID() }
     }
     const response = await api<Row>('/sessions/' + row.id + '/turns', 'POST', { text, clientMessageId: retryKey.id })
+    if (!active || generation !== change) {
+      if (active) void history().catch(() => undefined)
+      return
+    }
     retryKey = undefined
-    question.value = ''
+    if (question.value.trim() === text) question.value = ''
     if (route.params.id !== row.id) await router.replace('/ask/' + row.id)
     else if (session.value?.id === row.id) {
       session.value.turns = [...session.value.turns, response]
@@ -136,16 +155,17 @@ async function send() {
     }
     void history().catch(() => undefined)
     safeScroll()
-  } catch (error) { notice(errorMessage(error), true) }
+  } catch (error) { if (active && generation === change) notice(errorMessage(error), true) }
   finally { sending.value = false }
 }
-function fill(value: string) { question.value = value; composer.value?.focus() }
 function originalLink(item: Row) {
   const page = /第 (\d+) 页/.exec(item.position)?.[1]
   return '/api/v1/sources/' + item.sourceId + '/file?deviceId=' + deviceId.value + '&chunkId=' + item.id
     + (page ? '#page=' + page : '')
 }
 async function newSession() {
+  if (sending.value) return
+  resetSession()
   question.value = ''
   showHistory.value = false
   if (route.path !== '/ask') await router.push('/ask')
@@ -194,11 +214,11 @@ async function escalate() {
 </script>
 
 <template>
-  <main class="page">
+  <main class="page ask-page">
     <div class="page-heading"><div><h1>智能问答</h1><p>描述现场现象，核对适用的手册和历史案例。</p></div><button v-if="session?.turns?.length" class="btn secondary" @click="createDraft"><ClipboardPlus :size="18"/> 生成工单草稿</button></div>
     <div class="ask-layout">
       <aside :class="['card', 'history-panel', { 'history-visible': showHistory }]">
-        <button class="btn secondary new-chat" @click="newSession"><Plus :size="18"/> 新建诊断</button>
+        <button class="btn secondary new-chat" :disabled="sending" @click="newSession"><Plus :size="18"/> 新建诊断</button>
         <h2><History :size="15"/> 诊断记录</h2>
         <p v-if="!sessions.some(row => row.sequence)" class="muted history-empty">暂无诊断记录</p>
         <div v-for="row in sessions.filter(item => item.sequence)" :key="row.id" class="history-entry">
@@ -208,9 +228,9 @@ async function escalate() {
       </aside>
       <section class="card chat-card">
         <div class="chat-head">
-          <button class="icon-btn mobile-history" aria-label="诊断记录" @click="showHistory = !showHistory"><History :size="20"/></button>
+          <button class="icon-btn mobile-history" aria-label="诊断记录" :aria-expanded="showHistory" @click="showHistory = !showHistory"><History :size="20"/></button>
           <div class="device-select">
-            <button class="btn device-btn" :aria-expanded="pickDevice" @click="pickDevice = !pickDevice">
+            <button class="btn device-btn" :disabled="sending" :aria-expanded="pickDevice" @click="pickDevice = !pickDevice">
               <Cpu :size="18"/>
               <span v-if="currentDevice" class="device-label">
                 <b>{{ currentDevice.name }}</b>
@@ -218,7 +238,8 @@ async function escalate() {
               </span>
               <span v-else>选择设备</span><ChevronDown :size="15"/>
             </button>
-            <div v-if="pickDevice" class="device-options">
+            <Transition name="popover">
+            <div v-if="pickDevice" class="device-options glass" @keydown.esc.stop="pickDevice = false">
               <label class="search-field"><Search :size="16"/><input v-model="deviceSearch" placeholder="搜索名称、型号、批次或位置" aria-label="搜索设备"/></label>
               <button v-for="item in matchedDevices" :key="item.id" :class="{ selected: item.id === deviceId }" @click="selectDevice(item)">
                 <b>{{ item.name }}{{ item.id === deviceId ? ' · 当前' : '' }}</b>
@@ -226,16 +247,16 @@ async function escalate() {
               </button>
               <p v-if="!matchedDevices.length" class="muted">没有匹配的设备。请联系管理员维护台账。</p>
             </div>
+            </Transition>
           </div>
-          <button class="icon-btn mobile-history" aria-label="新建诊断" @click="newSession"><Plus :size="20"/></button>
+          <button class="icon-btn mobile-history" aria-label="新建诊断" :disabled="sending" @click="newSession"><Plus :size="20"/></button>
         </div>
         <div class="chat-messages">
           <div v-if="loading" class="loading"><LoaderCircle :size="20" /> 正在恢复会话…</div>
           <div v-else-if="!session?.turns?.length" class="chat-welcome">
-            <div class="welcome-mark"><Sparkles :size="29"/></div><h2>{{ store.devices.length ? '今天要排查什么问题？' : '请先添加设备' }}</h2>
+            <div class="welcome-mark" aria-hidden="true"><Sparkles :size="32" :stroke-width="1.7"/></div><h2>{{ store.devices.length ? '今天要排查什么问题？' : '请先添加设备' }}</h2>
             <p>{{ store.devices.length ? '输入故障码或描述现场现象，问答会附上可核查的依据。' : '请由平台管理员添加设备，再由知识管理员导入适用资料。' }}</p>
-            <div v-if="store.devices.length" class="suggestions"><button v-for="prompt in defaultPrompts" :key="prompt" @click="fill(prompt)">{{ prompt }}<ArrowRight :size="16"/></button></div>
-            <RouterLink v-else-if="store.profile?.role === 'platform'" class="btn secondary" to="/admin">打开设备台账 <ChevronRight :size="16"/></RouterLink>
+            <RouterLink v-if="!store.devices.length && store.profile?.role === 'platform'" class="btn secondary" to="/admin">打开设备台账 <ChevronRight :size="16"/></RouterLink>
           </div>
           <div v-else v-for="turn in session.turns" :key="turn.id" class="turn">
             <div class="user-message">{{ turn.text }}</div>
@@ -243,7 +264,7 @@ async function escalate() {
               <div class="answer-title"><span class="tile-icon mint compact"><Sparkles :size="17"/></span><strong>知维助手</strong></div>
               <p v-if="turn.status === 'queued'" class="loading"><LoaderCircle :size="17"/> 正在查找适用资料…</p>
               <template v-else>
-                <p class="answer-body">{{ turn.answer }}</p>
+                <p class="answer-body" aria-live="polite">{{ turn.answer }}</p>
                 <div v-if="turn.citations?.length" class="citations">
                   <h3><BookOpen :size="16"/> {{ turn.decision === 'evidence' ? '相关资料' : '资料出处' }}</h3>
                   <button v-for="(item, index) in turn.citations" :key="item.id" @click="evidence = item"><span class="ref-index">{{ index + 1 }}</span><span><b>{{ item.title }}</b><small>{{ item.demo ? '演示样例 · ' : '' }}{{ categories[item.category] }} · {{ item.position }} · V{{ item.version }}</small></span><ChevronRight :size="17"/></button>
@@ -260,7 +281,7 @@ async function escalate() {
               </template>
             </div>
           </div>
-          <div ref="bottom"></div>
+          <div ref="bottom" class="chat-end"></div>
         </div>
         <form class="composer" @submit.prevent="send">
           <textarea ref="composer" v-model="question" placeholder="描述现场情况，或输入故障码…" aria-label="维修问题" maxlength="3000" rows="2" @keydown.enter.exact.prevent="send"></textarea>
@@ -269,27 +290,35 @@ async function escalate() {
         <p class="composer-note"><CircleAlert :size="13"/> 处置前请核对手册版本和设备适用范围。</p>
       </section>
     </div>
-    <dialog v-if="evidence" open class="sheet" aria-label="资料出处" @keydown.esc="evidence = null">
-      <div class="sheet-head"><div><p class="eyebrow">{{ evidence.demo ? '演示样例 · ' : '' }}{{ categories[evidence.category] }} · V{{ evidence.version }}</p><h2>{{ evidence.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="evidence = null"><X :size="22"/></button></div>
-      <div class="sheet-body"><p class="muted">{{ evidence.number }} · {{ evidence.position }}</p><div class="document-text">{{ evidence.text }}</div>
-        <div class="tag-row">
-          <a v-if="evidence.referenceUrl" class="btn secondary" :href="evidence.referenceUrl" target="_blank" rel="noopener noreferrer"><ArrowUpRight :size="17"/> 查看发布来源</a>
-          <a v-if="!evidence.demo" class="btn secondary" :href="originalLink(evidence)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> 查看入库文件</a>
+    <Transition name="overlay">
+      <dialog v-if="evidence" v-sheet-drag="() => { evidence = null }" open class="sheet" aria-label="资料出处" @keydown.esc="evidence = null">
+        <div class="sheet-head"><div><p class="eyebrow">{{ evidence.demo ? '演示样例 · ' : '' }}{{ categories[evidence.category] }} · V{{ evidence.version }}</p><h2>{{ evidence.title }}</h2></div><button class="icon-btn" aria-label="关闭出处" @click="evidence = null"><X :size="22"/></button></div>
+        <div class="sheet-body"><p class="muted">{{ evidence.number }} · {{ evidence.position }}</p><div class="document-text">{{ evidence.text }}</div>
+          <div class="tag-row">
+            <a v-if="evidence.referenceUrl" class="btn secondary" :href="evidence.referenceUrl" target="_blank" rel="noopener noreferrer"><ArrowUpRight :size="17"/> 查看发布来源</a>
+            <a v-if="!evidence.demo" class="btn secondary" :href="originalLink(evidence)" target="_blank" rel="noopener"><ArrowDownToLine :size="17"/> 查看入库文件</a>
+          </div>
         </div>
-      </div>
-    </dialog>
-    <div v-if="evidence || escalateTurn || deleteTarget" class="backdrop" @click="evidence = null; escalateTurn = null; closeDelete()"></div>
-    <dialog v-if="deleteTarget" open class="modal" aria-label="删除对话" @keydown.esc.prevent="closeDelete">
-      <div class="sheet-head"><h2>删除这条对话？</h2><button class="icon-btn" aria-label="关闭" :disabled="deleting" @click="closeDelete"><X :size="22"/></button></div>
-      <div class="sheet-body form-stack">
-        <p>「{{ deleteTarget.title }}」将从诊断记录中删除。已提交到工单和专家待办的内容仍可在原业务记录中查看。</p>
-        <div class="button-row"><button class="btn secondary" :disabled="deleting" @click="closeDelete">取消</button><button class="btn destructive" :disabled="deleting" @click="deleteSession">{{ deleting ? '正在删除…' : '删除对话' }}</button></div>
-      </div>
-    </dialog>
-    <dialog v-if="escalateTurn" open class="modal" aria-label="转交班组专家">
-      <div class="sheet-head"><h2>{{ feedback ? '反馈答复或引用' : '转交班组专家' }}</h2><button class="icon-btn" aria-label="取消" @click="escalateTurn = null"><X :size="22"/></button></div>
-      <form class="sheet-body form-stack" @submit.prevent="escalate"><p>{{ escalateTurn.text }}</p><label>补充说明<textarea v-model="note" rows="4" maxlength="1500" :required="feedback" placeholder="补充现场条件或需要核实的内容"></textarea></label><div class="button-row"><button class="btn primary">提交专家待办</button></div></form>
-    </dialog>
+      </dialog>
+    </Transition>
+    <Transition name="scrim">
+      <div v-if="evidence || escalateTurn || deleteTarget" class="backdrop" @click="evidence = null; escalateTurn = null; closeDelete()"></div>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="deleteTarget" open class="modal" aria-label="删除对话" @keydown.esc.prevent="closeDelete">
+        <div class="sheet-head"><h2>删除这条对话？</h2><button class="icon-btn" aria-label="关闭" :disabled="deleting" @click="closeDelete"><X :size="22"/></button></div>
+        <div class="sheet-body form-stack">
+          <p>「{{ deleteTarget.title }}」将从诊断记录中删除。已提交到工单和专家待办的内容仍可在原业务记录中查看。</p>
+          <div class="button-row"><button class="btn secondary" :disabled="deleting" @click="closeDelete">取消</button><button class="btn destructive" :disabled="deleting" @click="deleteSession">{{ deleting ? '正在删除…' : '删除对话' }}</button></div>
+        </div>
+      </dialog>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="escalateTurn" open class="modal" aria-label="转交班组专家" @keydown.esc="escalateTurn = null">
+        <div class="sheet-head"><h2>{{ feedback ? '反馈答复或引用' : '转交班组专家' }}</h2><button class="icon-btn" aria-label="取消" @click="escalateTurn = null"><X :size="22"/></button></div>
+        <form class="sheet-body form-stack" @submit.prevent="escalate"><p>{{ escalateTurn.text }}</p><label>补充说明<textarea v-model="note" rows="4" maxlength="1500" :required="feedback" placeholder="补充现场条件或需要核实的内容"></textarea></label><div class="button-row"><button class="btn primary">提交专家待办</button></div></form>
+      </dialog>
+    </Transition>
   </main>
 </template>
 

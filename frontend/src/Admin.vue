@@ -11,6 +11,10 @@ const data = ref<Row | null>(null)
 const dialog = ref('')
 const device = ref({ number: '', name: '', model: '', batch: '', location: '' })
 const account = ref({ username: '', name: '', role: 'tech' as Role, password: '', models: '', active: true })
+const batchLimit = 50
+const bulkScope = ref({ role: 'tech' as Role, models: '', active: true })
+const bulkRows = ref<{ id: number; username: string; name: string; password: string }[]>([])
+let bulkRowId = 0
 const editing = ref(false)
 const error = ref('')
 const working = ref(false)
@@ -33,6 +37,42 @@ function editAccount(row?: Row) {
     : { username: '', name: '', role: 'tech', password: '', models: '', active: true }
   editing.value = !!row; dialog.value = 'account'; error.value = ''
 }
+function newBulkRow(username = '', name = '', password = '') {
+  return { id: ++bulkRowId, username, name, password }
+}
+function openBulkAccounts() {
+  bulkScope.value = { role: 'tech', models: '', active: true }
+  bulkRows.value = [newBulkRow()]
+  dialog.value = 'batch'
+  error.value = ''
+}
+function closeDialog() {
+  if (dialog.value === 'batch') {
+    if (working.value) return
+    bulkRows.value = []
+  }
+  dialog.value = ''
+}
+function pasteAccounts(event: ClipboardEvent, index: number) {
+  const value = event.clipboardData?.getData('text/plain')
+  if (!value?.includes('\t')) return
+  event.preventDefault()
+  const rows = value.split(/\r\n|\n|\r/).filter(line => line.trim()).map(line => line.split('\t'))
+  if (!rows.length || rows.some(row => row.length < 2 || row.length > 3)) {
+    error.value = '请粘贴账号和名称两列。本地密码可放在第三列。'
+    return
+  }
+  if (bulkRows.value.length - 1 + rows.length > batchLimit) {
+    error.value = '每批最多创建 ' + batchLimit + ' 个账号'
+    return
+  }
+  bulkRows.value.splice(index, 1, ...rows.map(([username, name, password]) =>
+    newBulkRow(username.trim(), name.trim(), password)))
+  error.value = ''
+}
+function modelList(value: string) {
+  return value.split(/[,，]/).map(model => model.trim()).filter(Boolean)
+}
 async function operation(work: () => Promise<void>) {
   if (working.value) return
   error.value = ''; working.value = true
@@ -42,8 +82,20 @@ async function operation(work: () => Promise<void>) {
 }
 function saveDevice() { return operation(async () => { await api('/devices', 'POST', device.value); dialog.value = ''; notice('设备台账已保存') }) }
 function saveAccount() { return operation(async () => {
-  await api('/accounts', 'POST', { ...account.value, models: account.value.models.split(/[,，]/).map(value => value.trim()).filter(Boolean) })
+  await api('/accounts', 'POST', { ...account.value, models: modelList(account.value.models) })
   dialog.value = ''; notice('账号权限已保存')
+}) }
+function saveBulkAccounts() { return operation(async () => {
+  const { role, models, active } = bulkScope.value
+  const scope = modelList(models)
+  const result = await api<{ count: number }>('/accounts/batch', 'POST', {
+    accounts: bulkRows.value.map(({ username, name, password }) => ({
+      username, name, password, role, models: scope, active,
+    })),
+  })
+  bulkRows.value = []
+  dialog.value = ''
+  notice('已创建 ' + result.count + ' 个账号')
 }) }
 function syncDevices() { return operation(async () => {
   const result = await api<{ count: number }>('/devices/sync', 'POST')
@@ -66,7 +118,10 @@ function reconcile(row: Row, action: string) { return operation(async () => {
     <section v-else class="card list-card">
       <div class="filters"><div class="tabs"><button v-for="(label,key) in tabs" :key="key" :class="{ on: tab === key }" @click="tab = key">{{ label }}</button></div>
         <div v-if="tab === 'devices'" class="button-row"><button v-if="data?.integrations?.registry" class="btn secondary" :disabled="working" @click="syncDevices"><RefreshCw :size="16"/> 同步台账</button><button class="btn primary" @click="editDevice()"><Plus :size="17"/> 添加设备</button></div>
-        <button v-if="tab === 'accounts'" class="btn primary" @click="editAccount()"><Plus :size="17"/> 新建账号</button>
+        <div v-if="tab === 'accounts'" class="button-row">
+          <button class="btn secondary" @click="openBulkAccounts"><Users :size="17"/> 批量创建</button>
+          <button class="btn primary" @click="editAccount()"><Plus :size="17"/> 新建账号</button>
+        </div>
       </div>
       <template v-if="tab === 'devices'">
         <div v-if="!store.devices.length" class="empty"><Cpu :size="34"/><b>暂无设备</b><p>添加设备或接入企业台账后即可开展诊断。</p></div>
@@ -91,15 +146,59 @@ function reconcile(row: Row, action: string) { return operation(async () => {
         <div v-for="row in data?.audit || []" :key="row.id" class="batch-row"><span>{{ row.action }} · {{ row.actorName || row.actor }}</span><small>{{ row.requestId?.slice(0, 12) }}</small><small>{{ date(row.created, true) }}</small></div>
       </div>
     </section>
-    <div v-if="dialog" class="backdrop" @click="dialog = ''"></div>
-    <dialog v-if="dialog" open class="modal" :aria-label="dialog === 'device' ? '维护设备' : '维护账号'">
-      <div class="sheet-head"><h2>{{ dialog === 'device' ? (editing ? '编辑设备' : '添加设备') : (editing ? '编辑账号权限' : '创建账号') }}</h2><button class="icon-btn" aria-label="取消" @click="dialog = ''"><X :size="22"/></button></div>
-      <form v-if="dialog === 'device'" class="sheet-body form-stack" @submit.prevent="saveDevice"><div class="form-grid">
-        <label>设备编号<input v-model="device.number" :disabled="editing" required maxlength="80"/></label><label>设备名称<input v-model="device.name" required maxlength="120"/></label><label>型号<input v-model="device.model" required maxlength="80"/></label><label>批次<input v-model="device.batch" maxlength="80"/></label><label>位置<input v-model="device.location" maxlength="120"/></label></div><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="working">保存台账</button></div></form>
-      <form v-else class="sheet-body form-stack" @submit.prevent="saveAccount"><div class="form-grid">
-        <label>账号<input v-model="account.username" :disabled="editing" required maxlength="64"/></label><label>名称<input v-model="account.name" required maxlength="80"/></label><label>角色<select v-model="account.role"><option v-for="(label,key) in roleNames" :key="key" :value="key">{{ label }}</option></select></label><label>本地密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" placeholder="至少 12 个字符"/></label></div>
-        <label>允许访问的设备型号<input v-model="account.models" placeholder="多个型号用逗号隔开，留空允许本组织所有型号"/></label><label class="check"><input v-model="account.active" type="checkbox"/> 启用账号</label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="working">保存权限</button></div></form>
-    </dialog>
+    <Transition name="scrim">
+      <div v-if="dialog" class="backdrop" @click="closeDialog"></div>
+    </Transition>
+    <Transition name="overlay">
+      <dialog v-if="dialog" open class="modal" :class="{ wide: dialog === 'batch' }" aria-labelledby="admin-dialog-title" @keydown.esc="closeDialog">
+        <div class="sheet-head">
+          <h2 id="admin-dialog-title">{{ dialog === 'batch' ? '批量创建账号' : dialog === 'device' ? (editing ? '编辑设备' : '添加设备') : (editing ? '编辑账号权限' : '创建账号') }}</h2>
+          <button class="icon-btn" aria-label="取消" :disabled="dialog === 'batch' && working" @click="closeDialog"><X :size="22"/></button>
+        </div>
+        <form v-if="dialog === 'device'" class="sheet-body form-stack" @submit.prevent="saveDevice"><div class="form-grid">
+          <label>设备编号<input v-model="device.number" :disabled="editing" required maxlength="80"/></label><label>设备名称<input v-model="device.name" required maxlength="120"/></label><label>型号<input v-model="device.model" required maxlength="80"/></label><label>批次<input v-model="device.batch" maxlength="80"/></label><label>位置<input v-model="device.location" maxlength="120"/></label></div><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="working">保存台账</button></div></form>
+        <form v-else-if="dialog === 'account'" class="sheet-body form-stack" @submit.prevent="saveAccount"><div class="form-grid">
+          <label>账号<input v-model="account.username" :disabled="editing" required maxlength="64"/></label><label>名称<input v-model="account.name" required maxlength="80"/></label><label>角色<select v-model="account.role"><option v-for="(label,key) in roleNames" :key="key" :value="key">{{ label }}</option></select></label><label>本地密码<input v-model="account.password" type="password" autocomplete="new-password" minlength="12" placeholder="至少 12 个字符"/></label></div>
+          <label>允许访问的设备型号<input v-model="account.models" placeholder="多个型号用逗号隔开，留空允许本组织所有型号"/></label><label class="check"><input v-model="account.active" type="checkbox"/> 启用账号</label><p v-if="error" class="error" role="alert">{{ error }}</p><div class="button-row"><button class="btn primary" :disabled="working">保存权限</button></div></form>
+        <form v-else class="sheet-body form-stack" @submit.prevent="saveBulkAccounts">
+          <div class="form-grid">
+            <label>本批角色<select v-model="bulkScope.role" :disabled="working"><option v-for="(label,key) in roleNames" :key="key" :value="key">{{ label }}</option></select></label>
+            <label>允许访问的设备型号<input v-model="bulkScope.models" :disabled="working" placeholder="逗号分隔，留空允许本组织所有型号"/></label>
+          </div>
+          <label class="check"><input v-model="bulkScope.active" :disabled="working" type="checkbox"/> 创建后启用</label>
+          <p class="muted">可在账号栏粘贴 Excel 的账号、名称两列，或逐行添加。需要本地登录时，为每个账号设置至少 12 个字符的密码。</p>
+          <div class="bulk-fields bulk-head" aria-hidden="true">
+            <span>账号</span><span>名称</span><span>本地密码</span>
+          </div>
+          <div v-for="(row, index) in bulkRows" :key="row.id" class="bulk-fields">
+            <input v-model="row.username" :aria-label="'第 ' + (index + 1) + ' 行账号'" placeholder="账号"
+              :disabled="working" required minlength="2" maxlength="64" pattern="[A-Za-z0-9_\-]+" @paste="pasteAccounts($event, index)"/>
+            <input v-model="row.name" :aria-label="'第 ' + (index + 1) + ' 行名称'" placeholder="名称" :disabled="working" required maxlength="80"/>
+            <input v-model="row.password" :aria-label="'第 ' + (index + 1) + ' 行本地密码'" placeholder="本地密码（选填）"
+              :disabled="working" type="password" autocomplete="new-password" minlength="12" maxlength="150"/>
+            <button type="button" class="icon-btn" :aria-label="'移除第 ' + (index + 1) + ' 行'"
+              :disabled="working || bulkRows.length === 1" @click="bulkRows.splice(index, 1)"><X :size="17"/></button>
+          </div>
+          <div class="button-row">
+            <button type="button" class="btn secondary" :disabled="working || bulkRows.length >= batchLimit" @click="bulkRows.push(newBulkRow())"><Plus :size="17"/> 添加一行</button>
+            <span class="muted">{{ bulkRows.length }} / {{ batchLimit }}</span>
+          </div>
+          <p v-if="error" class="error" role="alert">{{ error }}</p>
+          <div class="button-row"><button class="btn primary" :disabled="working">{{ working ? '正在创建…' : '创建这批账号' }}</button></div>
+        </form>
+      </dialog>
+    </Transition>
   </main>
 </template>
+
+<style scoped>
+.bulk-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.15fr) auto; gap: 8px; align-items: center; }
+.bulk-fields input { min-width: 0; }
+.bulk-head { color: var(--muted); }
+@media (max-width: 540px) {
+  .bulk-head { display: none; }
+  .bulk-fields { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .bulk-fields input[type="password"] { grid-column: 1 / 3; grid-row: 2; }
+}
+</style>
 

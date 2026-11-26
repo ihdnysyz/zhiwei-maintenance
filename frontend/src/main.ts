@@ -7,6 +7,7 @@ import Library from './Library.vue'
 import Drafts from './Drafts.vue'
 import Expert from './Expert.vue'
 import Admin from './Admin.vue'
+import { sheetDrag } from './sheetDrag'
 import './style.css'
 
 const router = createRouter({
@@ -21,5 +22,5 @@ const router = createRouter({
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
-createApp(App).use(router).mount('#app')
+createApp(App).directive('sheet-drag', sheetDrag).use(router).mount('#app')
 

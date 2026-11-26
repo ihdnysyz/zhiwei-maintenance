@@ -1,27 +1,30 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
-import { Activity, ArrowUpRight, BookOpen, Check, ChevronDown, ChevronRight, CircleAlert, ClipboardList, Command, LayoutGrid, LogOut, Menu, MessageCircle, Settings, Sparkles, Users, X } from 'lucide-vue-next'
+import { Activity, ArrowUpRight, BookOpen, Check, ChevronDown, ChevronRight, CircleAlert, ClipboardList, Command, LayoutGrid, LogOut, MessageCircle, Settings, Sparkles, Users, X } from 'lucide-vue-next'
 import { api, enter, errorMessage, loadDevices, notice, roleNames, store, type Profile, type Role } from './store'
 
 const route = useRoute()
 const router = useRouter()
 const menu = ref(false)
-const nav = ref(false)
 const loginError = ref('')
 const bootError = ref('')
 const busy = ref(false)
 const enterprise = ref(false)
 const credentials = ref({ username: '', password: '', org: 'pilot', token: '' })
 const links = computed(() => [
-  { to: '/', title: '概览', icon: LayoutGrid },
-  { to: '/ask', title: '智能问答', icon: Sparkles },
-  { to: '/library', title: '知识库', icon: BookOpen },
-  { to: '/drafts', title: '工单草稿', icon: ClipboardList },
-  { to: '/expert', title: '专家协作', icon: Users },
-  ...(store.profile?.role === 'platform' ? [{ to: '/admin', title: '系统管理', icon: Settings }] : []),
+  { to: '/', title: '概览', short: '概览', icon: LayoutGrid },
+  { to: '/ask', title: '智能问答', short: '问答', icon: Sparkles },
+  { to: '/library', title: '知识库', short: '知识库', icon: BookOpen },
+  { to: '/drafts', title: '工单草稿', short: '工单', icon: ClipboardList },
+  { to: '/expert', title: '专家协作', short: '协作', icon: Users },
+  ...(store.profile?.role === 'platform' ? [{ to: '/admin', title: '系统管理', short: '管理', icon: Settings }] : []),
 ])
 const active = (path: string) => path === '/' ? route.path === '/' : route.path.startsWith(path)
+const navStyle = computed(() => ({
+  '--nav-index': links.value.findIndex(item => active(item.to)),
+  '--nav-count': links.value.length,
+}))
 async function boot() {
   bootError.value = ''
   try {
@@ -93,44 +96,54 @@ async function logout() {
       </form>
     </section>
   </main>
-  <div v-else class="app-shell" @keydown.esc="menu = false; nav = false">
-    <button v-if="nav || menu" class="dismiss" aria-label="关闭菜单" @click="nav = false; menu = false"></button>
-    <aside :class="['sidebar', { 'nav-open': nav }]">
-      <RouterLink class="brand" to="/" @click="nav = false">
+  <div v-else class="app-shell" @keydown.esc="menu = false">
+    <button v-if="menu" class="dismiss" tabindex="-1" aria-label="关闭菜单" @click="menu = false"></button>
+    <aside class="sidebar glass">
+      <RouterLink class="brand" to="/">
         <span class="brand-mark"><Command :size="22" :stroke-width="2.4" /></span>
         <span><strong>知维</strong><small>设备维修知识库</small></span>
       </RouterLink>
       <div class="nav-section">工作空间</div>
-      <nav aria-label="主导航">
-        <RouterLink v-for="item in links" :key="item.to" :to="item.to" :class="{ selected: active(item.to) }" @click="nav = false">
+      <nav class="nav-track" aria-label="主导航" :style="navStyle" :data-inactive="navStyle['--nav-index'] < 0 || undefined">
+        <RouterLink v-for="item in links" :key="item.to" :to="item.to" :class="{ selected: active(item.to) }" :aria-current="active(item.to) ? 'page' : undefined">
           <component :is="item.icon" :size="19" :stroke-width="1.85" /><span>{{ item.title }}</span>
-          <ChevronRight v-if="active(item.to)" class="nav-chevron" :size="14" />
         </RouterLink>
       </nav>
       <div class="sidebar-foot">
-        <RouterLink to="/expert" class="side-help" @click="nav = false"><MessageCircle :size="18"/><span>联系班组专家</span><ArrowUpRight :size="15"/></RouterLink>
+        <RouterLink to="/expert" class="side-help"><MessageCircle :size="18"/><span>联系班组专家</span><ArrowUpRight :size="15"/></RouterLink>
         <div class="side-workspace"><div class="work-avatar"><Activity :size="17"/></div><div><b>{{ store.profile.demo ? '维修试点工作区' : store.profile.org }}</b><small>{{ store.profile.demo ? '演示环境' : '当前组织' }}</small></div></div>
       </div>
     </aside>
     <div class="app-body">
-      <header class="topbar">
-        <div class="crumb"><button class="icon-btn mobile-toggle" aria-label="打开导航" @click.stop="nav = !nav"><Menu :size="22"/></button><span>工作空间</span><ChevronRight :size="14" /><b>{{ route.meta.title }}</b></div>
+      <header class="topbar glass">
+        <div class="crumb"><RouterLink to="/" class="compact-brand" aria-label="知维概览"><span class="brand-mark"><Command :size="18"/></span></RouterLink><span>工作空间</span><ChevronRight :size="14" /><b>{{ route.meta.title }}</b></div>
         <div class="top-actions">
-          <span class="live"><i></i>{{ store.profile.demo ? '演示模式' : '工作区在线' }}</span><span class="top-separator"></span>
+          <span class="live"><i aria-hidden="true"></i>{{ store.profile.demo ? '演示模式' : '工作区在线' }}</span>
           <div class="profile-wrap">
             <button class="profile-btn" :aria-expanded="menu" @click.stop="menu = !menu"><span class="profile-avatar">{{ store.profile.name.slice(0, 1) }}</span><span class="profile-name">{{ store.profile.name }}</span><ChevronDown :size="14"/></button>
-            <div v-if="menu" class="profile-menu">
+            <Transition name="popover">
+            <div v-if="menu" class="profile-menu glass">
               <template v-if="store.profile.demo">
                 <div class="menu-caption">切换演示角色</div>
                 <button v-for="(label, key) in roleNames" :key="key" @click="switchRole(key)">{{ label }} <Check v-if="key === store.profile.role" :size="15"/></button>
               </template>
               <button @click="logout"><LogOut :size="16"/> 退出登录</button>
             </div>
+            </Transition>
           </div>
         </div>
       </header>
-      <RouterView :key="store.profile.org + ':' + store.profile.username" />
+      <RouterView v-slot="{ Component, route: viewRoute }">
+        <Transition name="page-enter">
+          <component :is="Component" :key="store.profile.org + ':' + store.profile.username + ':' + viewRoute.matched[0]?.path" />
+        </Transition>
+      </RouterView>
     </div>
+    <nav class="tabbar nav-track glass" aria-label="底部导航" :style="navStyle" :data-inactive="navStyle['--nav-index'] < 0 || undefined">
+      <RouterLink v-for="item in links" :key="item.to" :to="item.to" :class="{ selected: active(item.to) }" :aria-label="item.title" :aria-current="active(item.to) ? 'page' : undefined" @click="menu = false">
+        <component :is="item.icon" :size="21" :stroke-width="1.85"/><span>{{ item.short }}</span>
+      </RouterLink>
+    </nav>
   </div>
   <Transition>
     <div v-if="store.toast" :class="['toast', { bad: store.toastError }]" role="status">

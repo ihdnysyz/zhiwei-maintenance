@@ -1,0 +1,11 @@
+[
+  {"number":"PUB-LBC200","version":"2.0","category":"manual","title":"良机 LBC-200 厂家目录与标准工况","model":"LBC-200","referenceUrl":"https://liangchi.com.vn/uploads/san-pham/files/lbc.pdf"},
+  {"number":"PUB-WNS4125Q","version":"2.0","category":"manual","title":"四通 WNS4-1.25-Q 样本参数","model":"WNS4-1.25-Q","referenceUrl":"https://www.hnsstgl.cn/chanpin/lengning/2018/0326/47.html"},
+  {"number":"PUB-CARRIER-30HXC285A","version":"1.0","category":"manual","title":"开利 30HXC285A 标准电源版本选型数据","model":"30HXC285A","referenceUrl":"https://www.carrier.com/commercial/th/th/media/Catalog_30HXC_tcm192-218286.pdf"},
+  {"number":"PUB-KAIQUAN-200KQL280","version":"1.0","category":"manual","title":"凯泉 200KQL280-10-11/4 厂家目录","model":"200KQL280-10-11/4","referenceUrl":"https://www.kaiquan.com.cn/upload/2020-07/28/diliudaiKQLKQWxiliedanjibengyangben2020527.pdf"},
+  {"number":"PUB-SOJOLINE-GCK","version":"1.0","category":"manual","title":"双杰 GCK 系列低压抽出式开关柜选型","model":"GCK-1200","referenceUrl":"https://www.sojoline.com/products/13938.htm"},
+  {"number":"PUB-SIEMENS-G120C-FAULTS","version":"1.2","category":"manual","title":"西门子 SINAMICS G120C FSD–FSF 故障码与 F30003 排查依据","model":"G120C","batch":"FSD-FSF / V4.7 SP6","referenceUrl":"https://cache.industry.siemens.com/dl/files/756/109744756/att_909339/v1/G120C_FSD_F_cmpct_op_instr_1116_zh-CHS.pdf#page=96"},
+  {"number":"CASE-SAMR-2026-104-CFB","version":"2.0","category":"case","title":"循环流化床锅炉事故复盘","model":"电站循环流化床锅炉（培训）","referenceUrl":"https://www.samr.gov.cn/zw/zfxxgk/fdzdgknr/tzsbs/art/2026/art_10a343810d724e3e93204a288c359255.html"},
+  {"number":"CASE-SAMR-2026-104-FAN","version":"2.0","category":"case","title":"电站锅炉一次风机故障复盘","model":"煤粉锅炉一次风机（培训）","referenceUrl":"https://www.samr.gov.cn/zw/zfxxgk/fdzdgknr/tzsbs/art/2026/art_10a343810d724e3e93204a288c359255.html"},
+  {"number":"CASE-SZNS-2024-0715-GCK","version":"2.0","category":"case","title":"低压配电柜检修触电事故复盘（同类参考）","model":"GCK-1200","referenceUrl":"https://www.szns.gov.cn/nsqajj/gkmlpt/content/11/11895/post_11895793.html"}
+]

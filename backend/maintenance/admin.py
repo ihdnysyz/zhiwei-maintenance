@@ -1,6 +1,7 @@
 import json
 import re
 from typing import Literal
+from urllib.request import getproxies
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -11,7 +12,7 @@ from .common import actor, fail, get_db, need, permitted_device, revision, role
 from .conversations import redact, turn_view
 from .db import Job, Record, Scope, add, audit, audit_events, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
 from .library import WORKORDER_CASE_VERSION, queue_source, workorder_case_number
-from .knowledge import model_call
+from .knowledge import CODE_LABEL, model_call
 from .worker import external_headers
 
 router = APIRouter()
@@ -34,6 +35,15 @@ class Account(BaseModel):
     password: str = Field(default="", max_length=150)
     models: list[str] = Field(default_factory=list, max_length=100)
     active: bool = True
+
+
+class AccountBatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accounts: list[Account] = Field(min_length=1, max_length=50)
+
+
+class AccountBatchCreated(BaseModel):
+    count: int
 
 
 class TaskAction(BaseModel):
@@ -94,24 +104,47 @@ def accounts(user=Depends(actor), db=Depends(get_db, scope="function")):
     return [row.view("password") for row in db.scalars(records(user.org, "user").order_by(Record.key))]
 
 
+def account_values(body: Account):
+    if body.password and len(body.password) < 12:
+        fail(422, "WEAK_PASSWORD", f"账号 {body.username} 的本地密码至少需要 12 个字符")
+    values = dict(name=body.name, role=body.role, models=body.models, status="active" if body.active else "disabled")
+    if body.password:
+        values["password"] = password_hash(body.password)
+    return values
+
+
 @router.post("/accounts")
 def upsert_account(body: Account, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
     role(user, "platform")
     row = find(db, user.org, "user", key=body.username, lock=True)
     if user.key == body.username and (not body.active or body.role != "platform"):
         fail(409, "ADMIN_REQUIRED", "当前登录账户须保留平台管理员权限")
-    if body.password and len(body.password) < 12:
-        fail(422, "WEAK_PASSWORD", "本地密码至少 12 个字符")
-    data = dict(name=body.name, role=body.role, models=body.models)
-    if body.password:
-        data["password"] = password_hash(body.password)
-    status = "active" if body.active else "disabled"
+    data = account_values(body)
     if row:
-        row.change(status, **data)
+        row.change(**data)
     else:
-        row = add(db, user.org, "user", key=body.username, status=status, **data)
+        row = add(db, user.org, "user", key=body.username, **data)
     audit(db, user.org, user, "账号权限更新", row.id, request.state.request_id)
     return row.view("password")
+
+
+@router.post("/accounts/batch", status_code=201)
+def create_accounts(body: AccountBatch, request: Request, user=Depends(actor),
+                    db=Depends(get_db, scope="function")) -> AccountBatchCreated:
+    role(user, "platform")
+    usernames = set()
+    for item in body.accounts:
+        if item.username in usernames:
+            fail(409, "DUPLICATE_ACCOUNT", f"本批次内账号 {item.username} 重复，请修改后重试")
+        usernames.add(item.username)
+    existing = db.scalar(select(Record.key).where(
+        Record.org == user.org, Record.kind == "user", Record.key.in_(usernames)).order_by(Record.key).limit(1))
+    if existing:
+        fail(409, "ACCOUNT_EXISTS", f"账号 {existing} 已存在，请修改后重试")
+    for item in sorted(body.accounts, key=lambda account: account.username):
+        row = add(db, user.org, "user", key=item.username, **account_values(item))
+        audit(db, user.org, user, "批量创建账号", row.id, request.state.request_id)
+    return AccountBatchCreated(count=len(body.accounts))
 
 
 def can_see_task(user, row):
@@ -183,11 +216,15 @@ def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(acto
     if row.status != "linked" or not row.data.get("completedAt") or not permitted_device(user, device):
         fail(409, "CASE_NOT_ELIGIBLE", "需要已登记工单及相应设备权限")
     number = workorder_case_number(row.id)
-    text = redact(body.text).encode()
+    original = redact(body.text).encode()
+    fault = row.data.get("fields", {}).get("faultCode", "").strip()
+    text = original
+    if fault and not re.search(rf"(?im)^[ \t]*(?:{CODE_LABEL})[ \t]*[：:]?[ \t]*\S", body.text):
+        text = redact(f"故障码：{fault}\n{body.text}").encode()
     existing = find(db, user.org, "source", key=f"{number}:{WORKORDER_CASE_VERSION}")
     if existing:
         if (existing.data.get("category") == "case" and permitted_device(user, existing.data)
-                and existing.data.get("workorderLocator") == row.data["externalNumber"] and existing.blob == text):
+                and existing.data.get("workorderLocator") == row.data["externalNumber"] and existing.blob in {original, text}):
             return existing.view("digest", "approvedModelEndpoint")
         fail(409, "CASE_ALREADY_SUBMITTED", "该工单已有案例，请在案例回流中打开原记录继续维护")
     info = dict(number=number, version=WORKORDER_CASE_VERSION, title=f"{device['model']} 已结单经验案例",
@@ -271,8 +308,16 @@ def test_model_connection(user=Depends(actor)):
         message = {401: "模型 API Key 无效或未授权", 402: "模型账户余额不足",
                    403: "模型服务拒绝访问", 429: "模型服务暂时限流"}.get(status, f"模型服务返回 HTTP {status}")
         fail(502, "MODEL_REQUEST_FAILED", message)
-    except httpx.RequestError:
-        fail(502, "MODEL_UNREACHABLE", "无法连接模型服务，请检查网络和接口地址")
+    except httpx.RequestError as error:
+        message = str(error)
+        system_code = re.search(r"\[(?:WinError|Errno) \d+\]", message)
+        tls_code = re.search(r"\[SSL: ([A-Z_]+)\]", message)
+        diagnostic = " · ".join(filter(None, [
+            type(error).__name__, system_code.group() if system_code else "",
+            tls_code.group(1) if tls_code else "",
+            "已检测到 HTTPS 代理" if getproxies().get("https") else "未检测到 HTTPS 代理",
+        ]))
+        fail(502, "MODEL_UNREACHABLE", f"无法连接模型服务（{diagnostic}），请检查网络和接口地址")
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
         fail(502, "MODEL_RESPONSE_INVALID", "模型未返回符合约定的 JSON，请检查模型名和接口协议")
     return {"status": "ok", "model": cfg.chat_model}

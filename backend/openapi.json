@@ -277,6 +277,44 @@
         }
       }
     },
+    "/api/v1/accounts/batch": {
+      "post": {
+        "summary": "Create Accounts",
+        "operationId": "create_accounts_api_v1_accounts_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountBatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountBatchCreated"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/tasks": {
       "get": {
         "summary": "Tasks",
@@ -1908,6 +1946,38 @@
         ],
         "title": "Account"
       },
+      "AccountBatch": {
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/Account"
+            },
+            "type": "array",
+            "maxItems": 50,
+            "minItems": 1,
+            "title": "Accounts"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "accounts"
+        ],
+        "title": "AccountBatch"
+      },
+      "AccountBatchCreated": {
+        "properties": {
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "count"
+        ],
+        "title": "AccountBatchCreated"
+      },
       "Body_attach_api_v1_drafts__draft_id__attachments_post": {
         "properties": {
           "file": {
@@ -2270,7 +2340,8 @@
               "approve",
               "reject",
               "publish",
-              "block"
+              "block",
+              "authorize_model"
             ],
             "title": "Action"
           },

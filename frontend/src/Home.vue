@@ -16,9 +16,9 @@ onMounted(async () => {
   finally { ready.value = true }
 })
 const summary = computed(() => [
-  { title: '已发布资料', number: sources.value.filter(row => row.active).length, icon: BookOpen, theme: 'mint', to: '/library', note: '手册、工单与故障案例' },
-  { title: '诊断会话', number: sessions.value.filter(row => row.sequence).length, icon: MessageSquare, theme: 'blue', to: '/ask', note: '可随时继续现场问答' },
-  { title: '待确认工单', number: drafts.value.filter(row => row.status === 'draft').length, icon: ClipboardList, theme: 'amber', to: '/drafts', note: '核对现场处置后提交' },
+  { title: '已发布资料', number: sources.value.filter(row => row.active).length, icon: BookOpen, theme: 'mint', to: '/library' },
+  { title: '诊断会话', number: sessions.value.filter(row => row.sequence).length, icon: MessageSquare, theme: 'blue', to: '/ask' },
+  { title: '待确认工单', number: drafts.value.filter(row => row.status === 'draft').length, icon: ClipboardList, theme: 'amber', to: '/drafts' },
 ])
 const quick = computed(() => [
   ...(store.profile?.role === 'platform' && !store.devices.length
@@ -32,27 +32,24 @@ const today = new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', 
 <template>
   <main class="page dashboard">
     <div class="page-heading overview-heading">
-      <div><h1>设备维修工作台</h1><p>把维修经验沉淀为可查、可用的知识。</p></div>
+      <h1>设备维修工作台</h1>
       <div class="today"><Clock3 :size="15"/>{{ today }}</div>
     </div>
     <section class="hero">
       <div class="hero-content">
-        <div class="hero-label"><Sparkles :size="15"/> 智能维修助手</div>
-        <h2>让每一次维修，<br/>都有据可循。</h2>
-        <p>查询故障、核对原文，一键整理维修工单。</p>
+        <h2>现场故障，<br/>快速定位。</h2>
+        <p>按设备查故障码、排查步骤和原始出处。</p>
         <div class="hero-actions">
           <RouterLink to="/ask" class="btn hero-primary"><Sparkles :size="17"/> 开始问答 <ArrowRight :size="17"/></RouterLink>
           <RouterLink to="/library" class="btn hero-secondary">浏览知识库 <ArrowUpRight :size="16"/></RouterLink>
         </div>
       </div>
       <div class="hero-glow" aria-hidden="true"></div>
-      <span class="hero-point point-one" aria-hidden="true"></span><span class="hero-point point-two" aria-hidden="true"></span>
     </section>
     <section class="metrics" aria-label="工作区数据">
       <RouterLink v-for="item in summary" :key="item.title" :to="item.to" class="metric card">
         <div class="metric-head"><div :class="['tile-icon', item.theme]"><component :is="item.icon" :size="20"/></div><ArrowUpRight class="metric-arrow" :size="16"/></div>
         <div class="metric-main"><strong>{{ ready ? item.number : '—' }}</strong><span>{{ item.title }}</span></div>
-        <small>{{ item.note }}</small>
       </RouterLink>
     </section>
     <div class="overview-grid">
