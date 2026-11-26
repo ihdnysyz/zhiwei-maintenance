@@ -7,3 +7,8 @@ __pycache__/
 node_modules/
 dist/
 *.log
+/agent-workspace/config/
+/agent-workspace/.agent/
+/agent-workspace/.agent/tmp/
+/agent-workspace/workers/*/specs/
+/agent-workspace/*/specs/

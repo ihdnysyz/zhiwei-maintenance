@@ -1,0 +1,40 @@
+// 工作区配置。agentdev init 首次接入时复制到 agent-workspace/config/config.json5，之后不覆盖。
+// 缺少的字段取 agent-workspace/skills/common/notes/config.json5（本文件的原始版本）的默认值，可以只保留需要修改的字段。
+{
+  // 个人目录名：空字符串时，Git 根目录取 git user.name，非 Git 目录取电脑用户名。
+  // 修改后仅影响后续路径，不迁移已有目录；兼容 peronsal 拼写，personal 非空时优先。
+  personal: "",
+  // 显式 agentdev archive：六类开发记录超过 threshold 项后，保留按名称排序最新的 threshold 项。
+  // 较早条目移动到各目录 archived/01、02…，每组最多 group_size 项；两项均为正整数。
+  archive: { threshold: 50, group_size: 100 },
+  // Note 开关。false 时 verify.py 不触发 Note，也不按上限合并。
+  enabled: true,
+  // 每个日期目录（notes/<类型>/<YYYY-MM-DD>/）的 Note 上限。超出时 verify.py 把最早的几条合并为一条，使数量回到上限，内容不删除。
+  max_notes: 100,
+  // 自动更新开关。true 时 update.py 在展示欢迎语（SessionStart hook 和 Codex 启动入口 codex.sh）和检查到期时（Stop hook）比较版本号：
+  // 本地 AgentDevWorkSpace 的 publish/version 低于远端时，通过独立 update 入口更新全局程序并刷新当前工作区。
+  auto_update: true,
+  // 每轮结束时（Stop hook）版本检查的间隔（小时）；展示欢迎语时每次都检查。距上次检查（agent-workspace/.agent/env/last-update）超过该时长即到期。
+  auto_update_interval_hours: 24,
+  // 唯一版本源：主仓库 master 分支的 publish/version（GitHub 页面对应的原始文件）。
+  // 老版本配置地址读取时自动映射到此处；init 会保留注释并迁移旧地址。
+  update_url: "https://api.github.com/repos/LumenVestige/AgentDevWorkSpace/contents/publish/version?ref=master",
+  // 触发 Note 的扫描规则（verify.py 判断是否触发、create.py 填入提交时共用）。
+  scan: {
+    // 基线之后存在未记录到任何 Note 的提交时触发。false 时不按提交触发。
+    commits: true,
+    // 是否计入 merge 提交。
+    include_merges: false,
+    // 只统计改动了这些路径的提交（git pathspec，相对项目根目录），空数组表示全部，例如 ["src", "lib"]。
+    paths: [],
+    // 不统计只改动了这些路径的提交（git pathspec），例如 ["docs", "*.md"]。
+    exclude_paths: [],
+    // 工作区大规模改动：未提交的改动（含未跟踪文件，同样按 paths / exclude_paths 过滤）相对上次记录新增的
+    // 文件数达到 files 或行数（增 + 删）达到 lines 时，触发 large-scale-file-change Note。
+    large_change: {
+      enabled: true,
+      files: 20,
+      lines: 1000,
+    },
+  },
+}

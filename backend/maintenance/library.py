@@ -1,5 +1,4 @@
 import json
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -7,13 +6,15 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
-import httpx
 from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import delete, func, select
 
-from .common import actor, device_for, fail, get_db, need, permitted_device, revision, role
+from .common import actor, device_for, fail, get_db, need, permitted_device, revision
 from .db import Chunk, FaultIndex, Record, Scope, add, audit, audit_events, cfg, current_scopes, digest, enqueue, find, records, scopes, set_org
-from .knowledge import KINDS, applicability, authorized_citation, embeddings, fault_index_entries, model_approval_endpoint, retrieve
+from .knowledge import applicability, authorized_citation, fault_index_entries, model_approval_endpoint
+from .model_config import get_ai_settings
+from .permissions import Perm, can_manage_knowledge, require_perm
+from .rag import embed_documents, hybrid_search
 
 router = APIRouter()
 CONTENT_TYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -94,13 +95,12 @@ def queue_source(db, org, owner, info, filename, body, *, publish_on_parse=False
 
 @router.get("/sources")
 def list_sources(deviceId: str = "", user=Depends(actor), db=Depends(get_db, scope="function")):
-    can_manage = user.data["role"] in {"library", "expert"}
+    can_manage = can_manage_knowledge(user)
     selected = device_for(db, user, deviceId) if deviceId else None
     sources = list(db.scalars(records(user.org, "source").order_by(Record.updated.desc())))
     if can_manage:
         if selected:
             active, _ = applicability(db, user.org, selected)
-            # Keep pending items visible for calibration and review in the declared scope.
             sources = [row for row in sources if row.id in active or (
                 row.status in {"queued", "calibration", "review", "approved", "returned", "failed"}
                 and row.data["model"] in {"*", selected["model"]}
@@ -108,7 +108,7 @@ def list_sources(deviceId: str = "", user=Depends(actor), db=Depends(get_db, sco
         else:
             active = {scope.source for scope in db.scalars(current_scopes(user.org).where(Scope.status == "bind"))}
         return [{**row.view("digest", "approvedModelEndpoint"), "active": row.id in active}
-                for row in sources if permitted_device(user, row.data)]
+                for row in sources if permitted_device(user, row.data) or row.data.get("model") == "*"]
     active, devices = {}, {}
     if selected:
         devices[(selected["model"], selected["batch"])] = selected["id"]
@@ -128,7 +128,7 @@ def list_sources(deviceId: str = "", user=Depends(actor), db=Depends(get_db, sco
 @router.post("/sources/import", status_code=202)
 def import_sources(request: Request, files: Annotated[list[UploadFile], File()],
                    metadata: Annotated[str, Form()], user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     try:
         entries = [ImportInfo.model_validate(entry).model_dump(mode="json", exclude_none=True)
                    for entry in json.loads(metadata)]
@@ -159,19 +159,51 @@ def import_sources(request: Request, files: Annotated[list[UploadFile], File()],
     return batch.view()
 
 
+@router.post("/sources/{source_id}/reindex", status_code=202)
+def reindex_source(source_id: str, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
+    row = need(find(db, user.org, "source", id=source_id, lock=True))
+    if not permitted_device(user, row.data):
+        fail(403, "SCOPE_DENIED", "资料超出设备范围")
+    if not row.blob:
+        fail(409, "NO_ORIGINAL", "该资料没有原始文件，无法重新切片与向量化")
+    row.change("queued", ragStage="queued", indexReady=False, error="")
+    enqueue(db, user.org, "parse", row.id)
+    audit(db, user.org, user, "重建RAG切片与向量", row.id, request.state.request_id)
+    return row.view("digest", "approvedModelEndpoint")
+
+
+@router.post("/sources/reindex-all", status_code=202)
+def reindex_all_sources(request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
+    queued = 0
+    for row in db.scalars(records(user.org, "source")):
+        if not permitted_device(user, row.data) or not row.blob:
+            continue
+        if row.status != "queued":
+            row.change("queued", ragStage="queued", indexReady=False, error="")
+            enqueue(db, user.org, "parse", row.id)
+            queued += 1
+    audit(db, user.org, user, "全量重建RAG索引", str(queued), request.state.request_id)
+    return {"queued": queued}
+
+
 def import_view(db, user, batch, histories):
     result = []
     for item in batch.data["items"]:
         display = {**item}
         if item["status"] == "queued":
             row = find(db, user.org, "source", id=item["sourceId"])
+            if row and not permitted_device(user, row.data):
+                continue
             display.update(status=row.status if row else "failed", error=row.data.get("error", "") if row else "资料已清理")
         elif item["status"] == "conflict":
             row = find(db, user.org, "conflict", id=item["sourceId"])
+            if row and not permitted_device(user, row.data):
+                continue
             if row:
                 display.update(status=row.status, revision=row.rev, version=row.data["version"])
-                if permitted_device(user, row.data):
-                    display["operationHistory"] = histories.get(row.id, [])
+                display["operationHistory"] = histories.get(row.id, [])
         result.append(display)
     return {**batch.view(), "items": result, "operationHistory": histories.get(batch.id, [])}
 
@@ -187,29 +219,30 @@ def import_histories(db, user, batches):
 
 @router.get("/imports")
 def imports(user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     batches = list(db.scalars(records(user.org, "import").order_by(Record.updated.desc()).limit(30)))
     histories = import_histories(db, user, batches)
-    return [import_view(db, user, row, histories) for row in batches]
+    views = [import_view(db, user, row, histories) for row in batches]
+    return [v for v in views if v["items"] or not user.data.get("models")]
 
 
 @router.get("/imports/{batch_id}")
 def get_import(batch_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     batch = need(find(db, user.org, "import", id=batch_id))
     return import_view(db, user, batch, import_histories(db, user, [batch]))
 
 
 @router.post("/imports/{batch_id}/retry", status_code=202)
 def retry_import(batch_id: str, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     batch = need(find(db, user.org, "import", id=batch_id))
     retried = False
     for item in batch.data["items"]:
         if item["status"] == "queued":
             row = find(db, user.org, "source", id=item["sourceId"], lock=True)
             if row and row.status == "failed" and permitted_device(user, row.data):
-                row.change("queued", error="", publishOnParse=True)
+                row.change("queued", ragStage="queued", error="", publishOnParse=True)
                 enqueue(db, user.org, "parse", row.id)
                 audit(db, user.org, user, "重新解析资料", row.id, request.state.request_id)
                 retried = True
@@ -221,7 +254,7 @@ def retry_import(batch_id: str, request: Request, user=Depends(actor), db=Depend
 @router.post("/conflicts/{conflict_id}/resolve")
 def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
                      user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     row = need(find(db, user.org, "conflict", id=conflict_id, lock=True))
     revision(row, body.revision)
     if not permitted_device(user, row.data) or row.status != "conflict":
@@ -235,9 +268,11 @@ def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
         info["version"] = body.version
         source, _ = queue_source(db, user.org, user.key, info, row.data["filename"], row.blob, publish_on_parse=True)
         row.change("resolved", replacementId=source.id)
+        row.blob = None
         audit(db, user.org, user, "按新版本导入资料", source.id, request.state.request_id)
     else:
         row.change("discarded")
+        row.blob = None
     audit(db, user.org, user, "裁定资料版本冲突", row.id, request.state.request_id)
     return row.view("digest")
 
@@ -245,8 +280,8 @@ def resolve_conflict(conflict_id: str, body: ResolveConflict, request: Request,
 @router.get("/sources/{source_id}")
 def get_source(source_id: str, deviceId: str = "", user=Depends(actor), db=Depends(get_db, scope="function")):
     row = need(find(db, user.org, "source", id=source_id))
-    manager = user.data["role"] in {"library", "expert"}
-    if manager and not permitted_device(user, row.data):
+    manager = can_manage_knowledge(user)
+    if manager and not (permitted_device(user, row.data) or row.data.get("model") == "*"):
         fail(403, "SCOPE_DENIED", "资料超出设备范围")
     if not manager:
         allowed, _ = applicability(db, user.org, device_for(db, user, deviceId))
@@ -277,11 +312,11 @@ def get_source(source_id: str, deviceId: str = "", user=Depends(actor), db=Depen
 @router.post("/sources/{source_id}/trial")
 def source_trial(source_id: str, body: SourceTrial,
                  user=Depends(actor), db=Depends(get_db, scope="function")):
-    from .conversations import answer_question
+    from .agent import run_react_agent
 
-    role(user, "library", "expert")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE, Perm.KNOWLEDGE_REVIEW)
     source = need(find(db, user.org, "source", id=source_id))
-    if not permitted_device(user, source.data):
+    if not (permitted_device(user, source.data) or source.data.get("model") == "*"):
         fail(403, "SCOPE_DENIED", "资料超出设备范围")
     if not source.data.get("indexReady"):
         fail(409, "INDEX_NOT_READY", "请等待资料解析完成")
@@ -289,17 +324,17 @@ def source_trial(source_id: str, body: SourceTrial,
     model, batch = source.data["model"], source.data.get("batch")
     if model not in {"*", device["model"]} or (batch and batch != device.get("batch")):
         return dict(decision="out_of_scope", answer="所选设备的型号或批次不在这份资料的适用范围内。",
-                    hits=[], referenceIds=[], requestedCodes=[], availableInAsk=False)
+                    hits=[], referenceIds=[], requestedCodes=[], reactSteps=[], availableInAsk=False)
     applicable, ambiguous = applicability(db, user.org, device)
-    result = answer_question(db, user.org, user, device, body.question, preview_source=source)
-    result.pop("_conflictDevice", None)
+    result = run_react_agent(db, user.org, device, body.question, preview_source=source)
     return {**result, "availableInAsk": not ambiguous and source.id in applicable}
 
 
 @router.get("/knowledge/search")
 def search(deviceId: str, q: Annotated[str, Query(min_length=1, max_length=300)],
            user=Depends(actor), db=Depends(get_db, scope="function")):
-    results, ambiguous = retrieve(db, user.org, device_for(db, user, deviceId), q, limit=12)
+    settings = get_ai_settings(db, user.org)
+    results, ambiguous = hybrid_search(db, user.org, device_for(db, user, deviceId), q, settings, top_k=12)
     if ambiguous:
         fail(409, "BATCH_REQUIRED", "请在设备台账中补全批次")
     return results
@@ -308,7 +343,7 @@ def search(deviceId: str, q: Annotated[str, Query(min_length=1, max_length=300)]
 @router.patch("/sources/{source_id}/chunks/{chunk_id}")
 def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request,
               user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     row = need(find(db, user.org, "source", id=source_id, lock=True))
     revision(row, body.revision)
     if not permitted_device(user, row.data) or row.status not in {"calibration", "returned"}:
@@ -324,20 +359,16 @@ def calibrate(source_id: str, chunk_id: str, body: Calibration, request: Request
     codes = fault_index_entries(user.org, row.id, target.id, target.position, target.body)
     if codes:
         db.execute(FaultIndex.__table__.insert(), codes)
-    target.embedding = None
-    target.embedding_model = ""
-    keyword_only = row.data.get("keywordOnly", False)
-    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:
-        from .conversations import redact
-        try:
-            target.embedding = embeddings([redact(body.text[:1800])])[0]
-            target.embedding_model = cfg.embedding_model
-        except (httpx.HTTPError, RuntimeError, ValueError, TypeError, KeyError):
-            keyword_only = True
+    from .conversations import redact
+    settings = get_ai_settings(db, user.org)
+    vectors, emb_model, emb_dim, degraded = embed_documents(settings, [redact(body.text)])
+    target.embedding = vectors[0] if vectors else None
+    target.embedding_model = emb_model
     original = row.data.get("importDigest", row.data["digest"])
     summary = digest(json.dumps([original, *[(item.position, item.body) for item in chunks]],
                                 ensure_ascii=False).encode())
-    row.change("calibration", digest=summary, importDigest=original, approvedDigest="", keywordOnly=keyword_only)
+    row.change("calibration", digest=summary, importDigest=original, approvedDigest="",
+               embeddingModel=emb_model, embeddingDim=emb_dim, keywordOnly=degraded)
     audit(db, user.org, user, "校正解析片段", row.id, request.state.request_id)
     return row.view("digest", "importDigest")
 
@@ -384,7 +415,7 @@ def apply_publication_scope(db, source, *, bind=True, start_at="", end_at="", ba
 
 @router.post("/sources/{source_id}/actions")
 def action(source_id: str, body: SourceAction, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "expert" if body.action in {"approve", "reject", "authorize_model"} else "library")
+    require_perm(user, Perm.KNOWLEDGE_REVIEW if body.action in {"approve", "reject", "authorize_model"} else Perm.KNOWLEDGE_MANAGE)
     source = need(find(db, user.org, "source", id=source_id, lock=True))
     revision(source, body.revision)
     data = source.data
@@ -445,22 +476,22 @@ def source_file(source_id: str, deviceId: str = "", chunkId: str = "", user=Depe
         if not citation or citation["sourceId"] != source_id:
             fail(404, "EVIDENCE_EXPIRED", "此资料引用已失效")
     else:
-        role(user, "library", "expert")
-        if not permitted_device(user, source.data):
+        require_perm(user, Perm.KNOWLEDGE_MANAGE, Perm.KNOWLEDGE_REVIEW)
+        if not (permitted_device(user, source.data) or source.data.get("model") == "*"):
             fail(403, "SCOPE_DENIED", "资料超出设备范围")
     if not source.blob:
-        fail(404, "NO_ORIGINAL", "此演示片段没有原件")
+        fail(404, "NO_ORIGINAL", "此资料没有原始文件")
     filename = source.data["filename"]
     ext = Path(filename).suffix.lower().strip(".")
-    return file_response(source.blob, filename, CONTENT_TYPES[ext], inline=ext == "pdf")
+    return file_response(source.blob, filename, CONTENT_TYPES.get(ext, "application/octet-stream"), inline=ext == "pdf")
 
 
 @router.get("/conflicts/{conflict_id}/file")
 def conflict_file(conflict_id: str, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library")
+    require_perm(user, Perm.KNOWLEDGE_MANAGE)
     row = need(find(db, user.org, "conflict", id=conflict_id))
     if not permitted_device(user, row.data):
         fail(403, "SCOPE_DENIED", "资料超出设备范围")
     filename = row.data["filename"]
-    return file_response(row.blob, filename, CONTENT_TYPES[Path(filename).suffix.lower().strip(".")])
+    return file_response(row.blob, filename, CONTENT_TYPES.get(Path(filename).suffix.lower().strip("."), "application/octet-stream"))
 

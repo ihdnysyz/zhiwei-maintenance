@@ -6,10 +6,12 @@ import httpx
 from sqlalchemy import delete, or_, select, text
 
 from .common import permitted_device
-from .conversations import answer_turn, expert_task
+from .conversations import answer_turn, expert_task, redact
 from .db import DB, Chunk, FaultIndex, Job, add, audit, cfg, find, init_db, set_org, timestamp, uid
-from .knowledge import embeddings, fault_index_entries, parse_file, split_blocks
+from .knowledge import fault_index_entries, parse_file
 from .library import apply_publication_scope
+from .model_config import get_ai_settings
+from .rag import chunk_blocks, embed_documents
 
 log = logging.getLogger("maintenance.worker")
 
@@ -110,21 +112,21 @@ def finish_external(db, job, result):
 def parse_source(job):
     with DB() as db:
         row = find(db, job.org, "source", id=job.target)
+        if not row:
+            raise ValueError("资料记录不存在")
+        settings = get_ai_settings(db, job.org)
         category = row.data["category"]
-        document = list(split_blocks(parse_file(row.data["filename"], row.blob, category), category))
+        blocks = parse_file(row.data["filename"], row.blob, category)
+        document = list(chunk_blocks(
+            blocks, category,
+            chunk_size=settings["chunkSize"], chunk_overlap=settings["chunkOverlap"],
+        ))
     if not document:
         raise ValueError("没有可校核的文字")
-    vectors = [None] * len(document)
-    degraded = False
-    if cfg.allow_model_data and cfg.embedding_model and not cfg.model_source_review:
-        from .conversations import redact
-        try:
-            for start in range(0, len(document), 16):
-                stop = min(len(document), start + 16)
-                vectors[start:stop] = embeddings([redact(item[1][:1800]) for item in document[start:stop]])
-        except (httpx.HTTPError, KeyError, ValueError, TypeError, RuntimeError):
-            degraded = True
-    return document, vectors, degraded
+    vectors, emb_model, emb_dim, degraded = embed_documents(
+        settings, [redact(item[1]) for item in document],
+    )
+    return document, vectors, emb_model, emb_dim, degraded, settings["chunkSize"], settings["chunkOverlap"]
 
 
 def run(job):
@@ -150,27 +152,34 @@ def run(job):
                 row = find(db, job.org, "source", id=job.target, lock=True)
                 if row and row.status == "queued":
                     set_org(db, job.org)
-                    document, vectors, degraded = result
+                    document, vectors, emb_model, emb_dim, degraded, chunk_size, chunk_overlap = result
                     db.execute(delete(FaultIndex).where(FaultIndex.org == job.org, FaultIndex.source == row.id))
                     db.execute(delete(Chunk).where(Chunk.org == job.org, Chunk.source == row.id))
                     codes = []
+                    embedded_count = 0
                     for (position, body, ocr), vector in zip(document, vectors):
                         chunk_id = uid()
+                        if vector is not None:
+                            embedded_count += 1
                         db.add(Chunk(id=chunk_id, org=job.org, source=row.id, position=position, body=body, ocr=ocr,
-                                     embedding=vector, embedding_model=cfg.embedding_model if vector is not None else ""))
+                                     embedding=vector, embedding_model=emb_model if vector is not None else ""))
                         codes.extend(fault_index_entries(job.org, row.id, chunk_id, position, body))
                     if codes:
                         db.execute(FaultIndex.__table__.insert(), codes)
                     case_review = row.data.get("category") == "case" and bool(row.data.get("workorderLocator"))
-                    fields = dict(indexReady=True, chunkCount=len(document), ocr=any(item[2] for item in document),
-                                  keywordOnly=degraded)
+                    fields = dict(
+                        indexReady=True, ragStage="indexed", chunkCount=len(document),
+                        embeddedCount=embedded_count, embeddingModel=emb_model, embeddingDim=emb_dim,
+                        chunkSize=chunk_size, chunkOverlap=chunk_overlap,
+                        ocr=any(item[2] for item in document), keywordOnly=degraded,
+                    )
                     if row.data.get("publishOnParse") and not case_review:
                         row.change(approvedDigest=row.data["digest"], **fields)
                         apply_publication_scope(db, row, until_scheduled=True)
-                        label = "资料解析完成，已自动生效"
+                        label = f"RAG 索引完成（{len(document)} 切片 · {emb_model}），已自动生效"
                     else:
                         row.change("review" if case_review else "calibration", **fields)
-                        label = "案例校验完成，已送独立审核" if case_review else "资料解析完成，等待校核"
+                        label = "案例校验完成，已送独立审核" if case_review else f"RAG 索引完成（{len(document)} 切片），等待校核"
                     audit(db, job.org, "worker", label, row.id, job.id)
             elif job.kind == "turn":
                 row = find(db, job.org, "turn", id=job.target)
@@ -180,7 +189,7 @@ def run(job):
                     if device:
                         result["expertTaskId"] = expert_task(db, job.org, session, row, device, "多份手册命中同一故障码").id
                     row.change("done", **result)
-                    current.error = "模型生成降级，已返回授权原文" if result.get("modelDegraded") else ""
+                    current.error = "模型生成降级，已返回增强检索结果" if result.get("modelDegraded") else ""
             else:
                 finish_external(db, job, result)
             current.state = "done"
@@ -196,7 +205,8 @@ def run(job):
             current.state = "failed"
             if job.kind == "parse":
                 row = find(db, job.org, "source", id=job.target, lock=True)
-                row.change("failed", error=display)
+                if row:
+                    row.change("failed", ragStage="failed", error=display)
             elif job.kind == "turn":
                 row = find(db, job.org, "turn", id=job.target, lock=True)
                 if row and row.status == "queued":
@@ -214,11 +224,15 @@ def main():
     if os.getenv("WORKER_INIT", "true").lower() == "true":
         init_db()
     while True:
-        job = claim()
-        if job:
-            run(job)
-        else:
-            time.sleep(0.3)
+        try:
+            job = claim()
+            if job:
+                run(job)
+            else:
+                time.sleep(0.3)
+        except Exception as exc:
+            log.warning("worker loop error: %s", type(exc).__name__)
+            time.sleep(1.0)
 
 
 if __name__ == "__main__":

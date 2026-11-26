@@ -4,15 +4,25 @@ from typing import Literal
 from urllib.request import getproxies
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
-from .common import actor, fail, get_db, need, permitted_device, revision, role
+from .common import actor, fail, get_db, need, permitted_device, revision
 from .conversations import redact, turn_view
 from .db import Job, Record, Scope, add, audit, audit_events, cfg, current_scopes, enqueue, find, now, password_hash, records, timestamp
 from .library import WORKORDER_CASE_VERSION, queue_source, workorder_case_number
-from .knowledge import CODE_LABEL, model_call
+from .knowledge import CODE_LABEL
+from .model_config import (
+    chat_completion,
+    chat_ready,
+    embed_texts_remote,
+    embedding_ready,
+    get_ai_settings,
+    public_ai_settings,
+    save_ai_settings,
+)
+from .permissions import Perm, has_perm, require_perm
 from .worker import external_headers
 
 router = APIRouter()
@@ -58,6 +68,23 @@ class CaseBody(BaseModel):
     text: str = Field(min_length=20, max_length=16000)
 
 
+class AISettingsBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = True
+    chatUrl: str = Field(default="", max_length=300)
+    chatApiKey: str | None = Field(default=None, max_length=300)
+    clearChatApiKey: bool = False
+    chatModel: str = Field(default="", max_length=120)
+    embeddingUrl: str = Field(default="", max_length=300)
+    embeddingApiKey: str | None = Field(default=None, max_length=300)
+    clearEmbeddingApiKey: bool = False
+    embeddingModel: str = Field(default="", max_length=120)
+    chunkSize: int = Field(default=600, ge=200, le=2000)
+    chunkOverlap: int = Field(default=100, ge=0, le=400)
+    topK: int = Field(default=6, ge=2, le=15)
+    maxReactSteps: int = Field(default=5, ge=1, le=8)
+
+
 def device_row(db, org, info):
     row = find(db, org, "device", key=info["number"], lock=True)
     if row:
@@ -75,7 +102,7 @@ def devices(user=Depends(actor), db=Depends(get_db, scope="function")):
 
 @router.post("/devices")
 def upsert_device(body: DeviceBody, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
+    require_perm(user, Perm.DEVICE_MANAGE)
     value = device_row(db, user.org, body.model_dump())
     audit(db, user.org, user, "台账更新", value["id"], request.state.request_id)
     return value
@@ -83,7 +110,7 @@ def upsert_device(body: DeviceBody, request: Request, user=Depends(actor), db=De
 
 @router.post("/devices/sync")
 def sync_devices(request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
+    require_perm(user, Perm.DEVICE_MANAGE)
     if not cfg.registry_url:
         fail(409, "NOT_CONFIGURED", "请配置企业设备台账接口")
     try:
@@ -98,10 +125,18 @@ def sync_devices(request: Request, user=Depends(actor), db=Depends(get_db, scope
     return {"count": len(rows)}
 
 
+def is_primary_admin(row):
+    return bool(row and (row.key == "admin" or row.data.get("primary")))
+
+
+def account_view(row):
+    return {**row.view("password"), "primary": is_primary_admin(row)}
+
+
 @router.get("/accounts")
 def accounts(user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
-    return [row.view("password") for row in db.scalars(records(user.org, "user").order_by(Record.key))]
+    require_perm(user, Perm.ACCOUNT_MANAGE)
+    return [account_view(row) for row in db.scalars(records(user.org, "user").order_by(Record.key))]
 
 
 def account_values(body: Account):
@@ -115,23 +150,48 @@ def account_values(body: Account):
 
 @router.post("/accounts")
 def upsert_account(body: Account, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
+    require_perm(user, Perm.ACCOUNT_MANAGE)
     row = find(db, user.org, "user", key=body.username, lock=True)
+    if row and is_primary_admin(row):
+        if not is_primary_admin(user):
+            fail(403, "PRIMARY_ADMIN_PROTECTED", "仅主管理员可修改主管理员账号")
+        if not body.active or body.role != "platform":
+            fail(409, "ADMIN_REQUIRED", "主管理员账号须保持启用且保留平台管理员权限")
     if user.key == body.username and (not body.active or body.role != "platform"):
         fail(409, "ADMIN_REQUIRED", "当前登录账户须保留平台管理员权限")
     data = account_values(body)
     if row:
+        revoke = (bool(body.password) or row.status != data["status"]
+                  or row.data.get("role") != data["role"] or row.data.get("models", []) != data["models"])
         row.change(**data)
+        if revoke and row.key != user.key:
+            db.execute(delete(Record).where(Record.org == user.org, Record.kind == "auth", Record.owner == row.key))
     else:
         row = add(db, user.org, "user", key=body.username, **data)
     audit(db, user.org, user, "账号权限更新", row.id, request.state.request_id)
-    return row.view("password")
+    return account_view(row)
+
+
+@router.delete("/accounts/{username}", status_code=204)
+def delete_account(username: str, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.ACCOUNT_MANAGE)
+    row = need(find(db, user.org, "user", key=username, lock=True), "账号不存在")
+    if is_primary_admin(row):
+        fail(403, "PRIMARY_ADMIN_PROTECTED", "主管理员账号不可删除")
+    if row.key == user.key:
+        fail(409, "ADMIN_REQUIRED", "不可删除当前登录账号")
+    if row.data.get("role") == "platform" and not is_primary_admin(user):
+        fail(403, "PRIMARY_ADMIN_REQUIRED", "仅主管理员可删除其他平台管理员")
+    db.execute(delete(Record).where(Record.org == user.org, Record.kind == "auth", Record.owner == row.key))
+    audit(db, user.org, user, "删除账号", row.key, request.state.request_id)
+    db.delete(row)
+    return Response(status_code=204)
 
 
 @router.post("/accounts/batch", status_code=201)
 def create_accounts(body: AccountBatch, request: Request, user=Depends(actor),
                     db=Depends(get_db, scope="function")) -> AccountBatchCreated:
-    role(user, "platform")
+    require_perm(user, Perm.ACCOUNT_MANAGE)
     usernames = set()
     for item in body.accounts:
         if item.username in usernames:
@@ -148,7 +208,7 @@ def create_accounts(body: AccountBatch, request: Request, user=Depends(actor),
 
 
 def can_see_task(user, row):
-    return ((user.data["role"] == "expert" or user.key == row.owner)
+    return ((has_perm(user, Perm.EXPERT_TASK) or user.key == row.owner)
             and permitted_device(user, row.data))
 
 
@@ -176,7 +236,7 @@ def task(task_id: str, user=Depends(actor), db=Depends(get_db, scope="function")
 
 @router.post("/tasks/{task_id}/actions")
 def task_action(task_id: str, body: TaskAction, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "expert")
+    require_perm(user, Perm.EXPERT_TASK)
     row = need(find(db, user.org, "expert", id=task_id, lock=True))
     if not can_see_task(user, row):
         fail(404, "NOT_FOUND", "待办不存在")
@@ -187,8 +247,8 @@ def task_action(task_id: str, body: TaskAction, request: Request, user=Depends(a
         row.change("assigned", assignee=user.key)
     elif body.action == "assign" and row.status in {"open", "assigned"} and (not assigned or assigned == user.key):
         other = need(find(db, user.org, "user", key=body.assignee), "专家账号不存在")
-        if other.status != "active" or other.data["role"] != "expert" or not permitted_device(other, row.data):
-            fail(422, "ASSIGNEE_SCOPE", "目标专家必须具有设备访问权限")
+        if other.status != "active" or not has_perm(other, Perm.EXPERT_TASK) or not permitted_device(other, row.data):
+            fail(422, "ASSIGNEE_SCOPE", "目标账号必须具有专家处理与设备访问权限")
         row.change("assigned", assignee=other.key)
     elif body.action == "reply" and row.status in {"assigned", "answered"} and assigned == user.key and note:
         row.change("answered", reply=note)
@@ -210,7 +270,7 @@ def task_action(task_id: str, body: TaskAction, request: Request, user=Depends(a
 
 @router.post("/drafts/{draft_id}/case")
 def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library", "expert")
+    require_perm(user, Perm.CASE_FEED)
     row = need(find(db, user.org, "draft", id=draft_id, lock=True))
     device = row.data["device"]
     if row.status != "linked" or not row.data.get("completedAt") or not permitted_device(user, device):
@@ -238,7 +298,7 @@ def feed_case(draft_id: str, body: CaseBody, request: Request, user=Depends(acto
 
 @router.get("/completed")
 def completed(user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "library", "expert")
+    require_perm(user, Perm.CASE_FEED)
     eligible = records(user.org, "draft").where(Record.status == "linked",
                                                 Record.data["completedAt"].as_string() != "")
     models = user.data.get("models")
@@ -264,9 +324,24 @@ def completed(user=Depends(actor), db=Depends(get_db, scope="function")):
     return result
 
 
+@router.get("/settings/ai")
+def read_ai_settings(user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.SYSTEM_MANAGE)
+    return public_ai_settings(get_ai_settings(db, user.org))
+
+
+@router.put("/settings/ai")
+def update_ai_settings(body: AISettingsBody, request: Request, user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.SYSTEM_MANAGE)
+    saved = save_ai_settings(db, user.org, body.model_dump())
+    audit(db, user.org, user, "更新模型与RAG配置", "ai", request.state.request_id)
+    return public_ai_settings(saved)
+
+
 @router.get("/operations")
 def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
+    require_perm(user, Perm.SYSTEM_MANAGE)
+    ai = get_ai_settings(db, user.org)
     jobs = list(db.scalars(select(Job).where(Job.org == user.org).order_by(Job.available.desc()).limit(100)))
     history = db.scalars(records(user.org, "audit").order_by(Record.created.desc()).limit(100))
     submissions = list(db.scalars(records(user.org, "submission").order_by(Record.updated.desc()).limit(100)))
@@ -282,27 +357,35 @@ def operations(user=Depends(actor), db=Depends(get_db, scope="function")):
                            error=job.error) for job in jobs], audit=[row.view() for row in history],
                 submissions=[{**row.view("payload"), "operationHistory": submission_history.get(row.id, [])}
                              for row in submissions],
-                integrations=dict(model=bool(cfg.model_url and cfg.model_key and cfg.allow_model_data and cfg.chat_model),
-                                  embedding=bool(cfg.embedding_model and cfg.allow_model_data and not cfg.model_source_review),
+                integrations=dict(model=chat_ready(ai),
+                                  embedding=embedding_ready(ai),
                                   identity=bool(cfg.id_userinfo_url),
                                   registry=bool(cfg.registry_url), workorder=bool(cfg.workorder_url and cfg.workorder_enabled)))
 
 
 @router.post("/integrations/model/test")
-def test_model_connection(user=Depends(actor)):
-    role(user, "platform")
-    if not (cfg.model_url and cfg.model_key and cfg.chat_model):
-        fail(409, "MODEL_NOT_CONFIGURED", "请在本地 .env 填写 MODEL_URL、CHAT_MODEL 和 MODEL_KEY 后重启")
+def test_model_connection(user=Depends(actor), db=Depends(get_db, scope="function")):
+    require_perm(user, Perm.SYSTEM_MANAGE)
+    ai = get_ai_settings(db, user.org)
+    if not (ai["chatUrl"] and ai["chatModel"]):
+        fail(409, "MODEL_NOT_CONFIGURED", "请先填写对话模型接口地址与模型名称")
     try:
-        response = model_call("chat/completions", {
-            "model": cfg.chat_model,
-            "temperature": 0,
-            "max_tokens": 96,
-            "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}],
-        }, connection_test=True)
-        if json.loads(response["choices"][0]["message"]["content"]).get("ok") is not True:
+        response = chat_completion(
+            ai,
+            [{"role": "user", "content": 'Return this JSON object exactly: {"ok":true}'}],
+            temperature=0,
+            max_tokens=96,
+            response_format={"type": "json_object"},
+            timeout=15.0,
+            ignore_enabled=True,
+        )
+        content = response["choices"][0]["message"]["content"]
+        if json.loads(content).get("ok") is not True:
             raise ValueError("Unexpected test response")
+        emb_dim = 0
+        if ai.get("embeddingModel"):
+            vecs = embed_texts_remote(ai, ["ping"], timeout=15.0, ignore_enabled=True)
+            emb_dim = len(vecs[0]) if vecs else 0
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
         message = {401: "模型 API Key 无效或未授权", 402: "模型账户余额不足",
@@ -319,8 +402,8 @@ def test_model_connection(user=Depends(actor)):
         ]))
         fail(502, "MODEL_UNREACHABLE", f"无法连接模型服务（{diagnostic}），请检查网络和接口地址")
     except (ValueError, KeyError, TypeError, IndexError, AttributeError):
-        fail(502, "MODEL_RESPONSE_INVALID", "模型未返回符合约定的 JSON，请检查模型名和接口协议")
-    return {"status": "ok", "model": cfg.chat_model}
+        fail(502, "MODEL_RESPONSE_INVALID", "模型未返回符合约定的响应，请检查模型名和接口协议")
+    return {"status": "ok", "model": ai["chatModel"], "embeddingModel": ai.get("embeddingModel", ""), "embeddingDim": emb_dim}
 
 
 class SubmissionAction(BaseModel):
@@ -331,7 +414,7 @@ class SubmissionAction(BaseModel):
 @router.post("/submissions/{submission_id}/actions", status_code=202)
 def check_submission(submission_id: str, body: SubmissionAction, request: Request,
                      user=Depends(actor), db=Depends(get_db, scope="function")):
-    role(user, "platform")
+    require_perm(user, Perm.SYSTEM_MANAGE)
     row = need(find(db, user.org, "submission", id=submission_id, lock=True))
     revision(row, body.revision)
     if row.status not in {"manual_review", "not_created"}:

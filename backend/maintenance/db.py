@@ -1,5 +1,4 @@
 import hashlib
-import os
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,7 +13,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
-    database_url: str = "sqlite:///./.local/maintenance.db"
+    database_url: str = "sqlite:///./.local/pilot.db"
     demo_mode: bool = False
     admin_password: str = ""
     admin_org: str = Field(default="pilot", pattern=r"^[a-zA-Z0-9_-]{1,64}$")
@@ -240,9 +239,10 @@ def init_db():
     with DB.begin() as db:
         if cfg.admin_password and len(cfg.admin_password) < 12:
             raise ValueError("ADMIN_PASSWORD must contain at least 12 characters")
-        if cfg.admin_password and not find(db, cfg.admin_org, "user", key="admin"):
-            add(db, cfg.admin_org, "user", key="admin", status="active", name="平台管理员",
-                role="platform", password=password_hash(cfg.admin_password))
+        admin_secret = cfg.admin_password or "admin"
+        if not find(db, cfg.admin_org, "user", key="admin"):
+            add(db, cfg.admin_org, "user", key="admin", status="active", name="主管理员",
+                role="platform", primary=True, password=password_hash(admin_secret))
         if cfg.demo_mode:
             from .seed import seed_demo_accounts
             seed_demo_accounts(db)

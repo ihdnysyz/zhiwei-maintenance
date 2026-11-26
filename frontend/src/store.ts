@@ -1,8 +1,25 @@
 import { reactive } from 'vue'
+import { ElMessage } from 'element-plus'
 
 export type Role = 'tech' | 'library' | 'expert' | 'platform'
 export type Row = Record<string, any> & { id: string; revision: number; status: string }
-export interface Profile { name: string; role: Role; org: string; username: string; demo: boolean }
+export type TagType = 'primary' | 'success' | 'info' | 'warning' | 'danger'
+export interface Profile {
+  name: string
+  role: Role
+  org: string
+  username: string
+  demo: boolean
+  primary?: boolean
+  models?: string[]
+  permissions?: string[]
+}
+
+export function can(...perms: string[]) {
+  const granted = store.profile?.permissions || []
+  return perms.some(perm => granted.includes(perm))
+}
+
 export const roleNames: Record<Role, string> = {
   tech: '维修人员', library: '知识管理员', expert: '班组专家', platform: '平台管理员',
 }
@@ -17,22 +34,32 @@ export const statuses: Record<string, string> = {
   manual_review: '待人工核对', done: '已完成', pending: '待执行', running: '执行中',
   resolved: '已登记新版本', discarded: '已保留原版本',
 }
+
+export function statusTag(status: string, active = false): TagType {
+  if (active || ['published', 'approved', 'created', 'done', 'active', 'answered', 'resolved'].includes(status)) return 'success'
+  if (['failed', 'conflict', 'manual_review', 'not_created', 'disabled', 'returned'].includes(status)) return 'danger'
+  if (['queued', 'calibration', 'review', 'draft', 'open', 'assigned', 'submitting', 'processing', 'pending', 'running', 'unknown'].includes(status)) return 'warning'
+  if (['confirmed', 'exported', 'linked'].includes(status)) return 'primary'
+  return 'info'
+}
+
+export function roleLabel(profile: Pick<Profile, 'role' | 'primary'> | null) {
+  if (!profile) return ''
+  return profile.primary ? '主管理员' : roleNames[profile.role]
+}
+
 export const store = reactive({
   profile: null as Profile | null,
+  defaultOrg: 'pilot',
   demoAvailable: false,
   enterpriseIdentity: false,
   workorderEnabled: false,
   ready: false,
   devices: [] as Row[],
-  toast: '',
-  toastError: false,
 })
-let toastTimer: number | undefined
+
 export function notice(message: string, error = false) {
-  store.toast = message
-  store.toastError = error
-  clearTimeout(toastTimer)
-  toastTimer = window.setTimeout(() => { store.toast = '' }, 4500)
+  ElMessage({ message, type: error ? 'error' : 'success', duration: 4000, showClose: true })
 }
 export function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : '操作失败，请重试'
@@ -41,8 +68,11 @@ export async function request(path: string, method = 'GET', payload?: object | F
   const headers = payload && !(payload instanceof FormData) ? { 'Content-Type': 'application/json' } : undefined
   let response: Response
   try {
-    response = await fetch('/api/v1' + path, { method, headers,
-      body: payload instanceof FormData ? payload : payload ? JSON.stringify(payload) : undefined })
+    response = await fetch('/api/v1' + path, {
+      method,
+      headers,
+      body: payload instanceof FormData ? payload : payload ? JSON.stringify(payload) : undefined,
+    })
   } catch {
     throw new Error('无法连接服务，请稍后重试')
   }
@@ -60,7 +90,6 @@ export async function loadDevices() {
 }
 export async function enter(role: Role) {
   store.profile = await api<Profile>('/auth/demo', 'POST', { role })
-  sessionStorage.removeItem('loggedOut')
   await loadDevices()
 }
 export function date(value: string, time = false) {
@@ -69,4 +98,3 @@ export function date(value: string, time = false) {
     ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
     : { month: 'long', day: 'numeric' }).format(new Date(value))
 }
-

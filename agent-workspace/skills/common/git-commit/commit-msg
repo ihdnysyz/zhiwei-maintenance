@@ -1,0 +1,5 @@
+#!/bin/sh
+# 拒绝不以 [fix] / [feature] / [research] / [del] / [update] 开头的提交信息；放行 git 自动生成的 Merge / Revert / fixup! / squash! 信息。
+head -n1 "$1" | grep -qE '^(\[(fix|feature|research|del|update)\] .+|Merge |Revert |fixup! |squash! )' && exit 0
+echo "提交信息必须以 [fix] / [feature] / [research] / [del] / [update] 开头，例如：[fix] 修复登录超时" >&2
+exit 1

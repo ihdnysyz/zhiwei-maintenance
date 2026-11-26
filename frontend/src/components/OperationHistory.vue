@@ -16,14 +16,17 @@ const formatter = new Intl.DateTimeFormat('zh-CN', {
 </script>
 
 <template>
-  <section v-if="events?.length" class="operation-history" aria-label="操作记录">
-    <h3>操作记录</h3>
-    <ol>
-      <li v-for="event in events" :key="event.id">
-        <b>{{ labels[event.action] || event.action }}</b>
-        <span :title="event.actor">{{ event.actorName }} <span v-if="event.actor !== event.actorName && event.actor !== 'worker'">（{{ event.actor }}）</span></span>
-        <time :datetime="event.at">{{ formatter.format(new Date(event.at)) }}</time>
-      </li>
-    </ol>
+  <section v-if="events?.length" class="op-history" aria-label="操作记录">
+    <el-divider content-position="left">操作记录</el-divider>
+    <el-timeline>
+      <el-timeline-item v-for="event in events" :key="event.id" :timestamp="formatter.format(new Date(event.at))" placement="top">
+        <div class="op-row">
+          <b>{{ labels[event.action] || event.action }}</b>
+          <span class="muted" :title="event.actor">
+            {{ event.actorName }}<template v-if="event.actor !== event.actorName && event.actor !== 'worker'">（{{ event.actor }}）</template>
+          </span>
+        </div>
+      </el-timeline-item>
+    </el-timeline>
   </section>
 </template>

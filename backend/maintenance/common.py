@@ -1,7 +1,6 @@
 import hmac
 import re
 import secrets
-from contextlib import contextmanager
 
 from fastapi import Depends, HTTPException, Request
 from sqlalchemy import text
@@ -59,8 +58,13 @@ def actor(request: Request, db=Depends(get_db, scope="function")):
 
 
 def profile(user):
+    from .permissions import user_permissions
+
     return dict(name=user.data["name"], username=user.key, role=user.data["role"],
-                org=user.org, demo=bool(user.data.get("demo")))
+                org=user.org, demo=bool(user.data.get("demo")),
+                primary=bool(user.key == "admin" or user.data.get("primary")),
+                models=list(user.data.get("models", [])),
+                permissions=sorted(user_permissions(user)))
 
 
 def role(user, *roles):

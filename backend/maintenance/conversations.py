@@ -4,15 +4,15 @@ import httpx
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .common import actor, device_for, fail, get_db, need, own, permitted_device, role
-from .db import Record, add, audit, cfg, enqueue, find, records
-from .knowledge import (SAFETY, applicability, authorized_citation, chunk_fault_codes, code_key, codes_in, fault_codes,
+from .common import actor, device_for, fail, get_db, need, own, permitted_device
+from .db import DB, Record, add, audit, cfg, enqueue, find, records
+from .knowledge import (SAFETY, authorized_citation, chunk_fault_codes, code_key, codes_in, fault_codes,
                         fault_sections, model_call, model_evidence, named_fault_matches, non_fault_numbers, normalize_code_text,
                         normalize_fault_tables, retrieve, suggested_device_refs, supports_symptoms,
                         standalone_fault_code, symptom_details, symptom_signals, terms)
@@ -123,7 +123,7 @@ def send(session_id: str, body: Message, request: Request, user=Depends(actor), 
             if previous.data["text"] != body.text:
                 fail(409, "IDEMPOTENCY_CONFLICT", "消息编号已经用于其他内容")
             return turn_view(db, user, previous, session)
-        if previous.status == "queued":
+        if previous.status in {"queued", "streaming"}:
             fail(409, "TURN_PENDING", "请等待当前问题完成")
     position = session.data["sequence"] + 1
     session.change(title=body.text[:40] if position == 1 else session.data["title"], sequence=position)
@@ -132,6 +132,85 @@ def send(session_id: str, body: Message, request: Request, user=Depends(actor), 
     enqueue(db, user.org, "turn", turn.id)
     audit(db, user.org, user, "提交问答", turn.id, request.state.request_id)
     return turn.view()
+
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@router.post("/sessions/{session_id}/turns/stream")
+def send_stream(session_id: str, body: Message, request: Request, user=Depends(actor),
+                db=Depends(get_db, scope="function")):
+    from .agent import run_react_agent_stream
+
+    session = active_session(db, user, session_id, lock=True)
+    device = device_for(db, user, session.data["deviceId"])
+    existing_turns = session_turns(db, user.org, session)
+    for previous in existing_turns:
+        if previous.data["clientMessageId"] == body.clientMessageId:
+            if previous.data["text"] != body.text:
+                fail(409, "IDEMPOTENCY_CONFLICT", "消息编号已经用于其他内容")
+            cached = turn_view(db, user, previous, session)
+            return StreamingResponse(iter([_sse("done", {"turn": cached})]), media_type="text/event-stream")
+        if previous.status in {"queued", "streaming"}:
+            fail(409, "TURN_PENDING", "请等待当前问题完成")
+
+    position = session.data["sequence"] + 1
+    session.change(title=body.text[:40] if position == 1 else session.data["title"], sequence=position)
+    turn = add(db, user.org, "turn", key=f"{session.id}:{position:08}", owner=session.id, status="streaming",
+               text=body.text, clientMessageId=body.clientMessageId, sequence=position)
+    audit(db, user.org, user, "提交问答", turn.id, request.state.request_id)
+    db.commit()
+
+    prior_snapshot = [
+        {"text": row.data.get("text", ""), "answer": row.data.get("answer", "")}
+        for row in existing_turns if row.status == "done"
+    ]
+    org, user_key, turn_id, sid, question = user.org, user.key, turn.id, session.id, body.text
+
+    def event_stream():
+        yield _sse("start", {"turnId": turn_id, "sequence": position, "text": question})
+        final_result = None
+        try:
+            with DB() as stream_db:
+                for ev in run_react_agent_stream(stream_db, org, device, question, prior_turns=prior_snapshot):
+                    ev_type = ev["type"]
+                    if ev_type == "complete":
+                        final_result = ev["result"]
+                    else:
+                        yield _sse(ev_type, {k: v for k, v in ev.items() if k != "type"})
+            with DB.begin() as write_db:
+                t_row = find(write_db, org, "turn", id=turn_id, lock=True)
+                s_row = find(write_db, org, "session", id=sid)
+                u_row = find(write_db, org, "user", key=user_key)
+                if t_row and final_result:
+                    t_row.change(
+                        "done",
+                        decision=final_result["decision"],
+                        answer=final_result["answer"],
+                        referenceIds=final_result["referenceIds"],
+                        reactSteps=final_result["reactSteps"],
+                        engine=final_result["engine"],
+                        modelDegraded=final_result.get("modelDegraded", False),
+                        contextStart=position,
+                    )
+                    write_db.flush()
+                    view_payload = turn_view(write_db, u_row, t_row, s_row) if (u_row and s_row) else t_row.view()
+                    yield _sse("done", {"turn": view_payload})
+        except Exception as exc:
+            logging.getLogger("maintenance.agent").warning("stream turn %s failed: %s", turn_id, type(exc).__name__)
+            with DB.begin() as write_db:
+                t_row = find(write_db, org, "turn", id=turn_id, lock=True)
+                if t_row and t_row.status == "streaming":
+                    t_row.change("done", decision="error", referenceIds=[], reactSteps=[],
+                                 answer="问答服务暂时不可用，请重试或将问题转交专家。")
+            yield _sse("error", {"message": "问答服务暂时不可用，请重试"})
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/sessions/{session_id}/turns/{turn_id}")
@@ -183,8 +262,8 @@ def escalate(session_id: str, turn_id: str, body: Feedback, request: Request, us
 
 
 def redact(value):
-    value = re.sub(r"1[3-9]\d{9}|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[已脱敏]", value)
-    return re.sub(r"(?<!\d)\d{17}[\dXx](?!\w)", "[已脱敏]", value)
+    value = re.sub(r"(?<!\d)\d{17}[\dXx](?!\w)", "[已脱敏]", value)
+    return re.sub(r"(?<!\d)1[3-9]\d{9}(?!\d)|\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b", "[已脱敏]", value)
 
 
 _SENTENCE_BREAK = re.compile(r"(?<=[。！？!?])|(?<=\.)\s+(?=[A-Z])|\n+")
@@ -587,21 +666,34 @@ def grounded_answer(question, evidence, primary="manual", fault_keys=(), *,
 
 
 def answer_turn(db, org, turn):
+    from .agent import run_react_agent
+
     session = need(find(db, org, "session", id=turn.owner))
     user = need(find(db, org, "user", key=session.owner))
     if user.status != "active":
         raise ValueError("用户访问已撤销")
     device = device_for(db, user, session.data["deviceId"])
-    prior = [row for row in session_turns(db, org, session) if row.data["sequence"] < turn.data["sequence"]]
-    trace = {} if cfg.rag_trace else None
-    result = answer_question(db, org, user, device, turn.data["text"], prior=prior,
-                             sequence=turn.data["sequence"], trace=trace)
-    if trace is not None:
+    prior = [
+        {"text": row.data.get("text", ""), "answer": row.data.get("answer", "")}
+        for row in session_turns(db, org, session)
+        if row.data["sequence"] < turn.data["sequence"] and row.status == "done"
+    ]
+    result = run_react_agent(db, org, device, turn.data["text"], prior_turns=prior)
+    if cfg.rag_trace:
         logging.getLogger("maintenance.worker").info("rag_trace %s", json.dumps({
-            "turnId": turn.id, **trace, "decision": result["decision"],
-            "citations": result["referenceIds"], "modelDegraded": result.get("modelDegraded", False),
-        }))
-    return result
+            "turnId": turn.id, "engine": result.get("engine"), "steps": len(result.get("reactSteps", [])),
+            "decision": result["decision"], "citations": result["referenceIds"],
+            "modelDegraded": result.get("modelDegraded", False),
+        }, ensure_ascii=False))
+    return {
+        "decision": result["decision"],
+        "answer": result["answer"],
+        "referenceIds": result["referenceIds"],
+        "reactSteps": result["reactSteps"],
+        "engine": result["engine"],
+        "modelDegraded": result.get("modelDegraded", False),
+        "contextStart": turn.data["sequence"],
+    }
 
 
 def answer_question(db, org, user, device, text, *, prior=(), sequence=1, preview_source=None, trace=None):

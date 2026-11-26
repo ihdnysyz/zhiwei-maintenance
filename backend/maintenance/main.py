@@ -8,14 +8,14 @@ from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import delete, text
 from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException
 
 from . import admin, conversations, drafts, library
-from .common import fail, get_db, identify, login, profile, verify_password
-from .db import cfg, digest, find, init_db, uid
-from .seed import DEMO_ORG, DEMO_USERS
+from .common import actor, fail, get_db, identify, login, profile, verify_password
+from .db import Record, audit, cfg, digest, find, init_db, password_hash, uid
+from .seed import DEMO_ORG
 
 
 @asynccontextmanager
@@ -72,7 +72,12 @@ def health(db=Depends(get_db, scope="function")):
 class Credentials(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=150)
-    org: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    org: str = Field(default="", max_length=64, pattern=r"^([A-Za-z0-9_-]+)?$")
+
+
+class PasswordChange(BaseModel):
+    currentPassword: str = Field(min_length=1, max_length=150)
+    newPassword: str = Field(min_length=6, max_length=150)
 
 
 class DemoLogin(BaseModel):
@@ -87,16 +92,30 @@ class IdentityToken(BaseModel):
 def state(request: Request, db=Depends(get_db, scope="function")):
     user = identify(request, db)
     return {"profile": profile(user) if user else None, "demoAvailable": cfg.demo_mode,
+            "defaultOrg": cfg.admin_org,
             "enterpriseIdentity": bool(cfg.id_userinfo_url),
             "workorderEnabled": bool(cfg.workorder_enabled and cfg.workorder_url)}
 
 
 @app.post("/api/v1/auth/login")
 def local_login(body: Credentials, response: Response, db=Depends(get_db, scope="function")):
-    user = find(db, body.org, "user", key=body.username)
+    org = body.org.strip() or cfg.admin_org
+    user = find(db, org, "user", key=body.username.strip())
     if not user or user.status != "active" or not verify_password(body.password, user.data.get("password")):
         fail(401, "INVALID_LOGIN", "组织、账号或密码不正确")
     return login(db, response, user)
+
+
+@app.post("/api/v1/auth/password")
+def change_password(body: PasswordChange, request: Request, response: Response,
+                    user=Depends(actor), db=Depends(get_db, scope="function")):
+    row = find(db, user.org, "user", key=user.key, lock=True)
+    if not row or not verify_password(body.currentPassword, row.data.get("password")):
+        fail(401, "INVALID_PASSWORD", "当前密码不正确")
+    row.change(password=password_hash(body.newPassword))
+    db.execute(delete(Record).where(Record.org == user.org, Record.kind == "auth", Record.owner == user.key))
+    audit(db, user.org, row, "修改登录密码", row.id, request.state.request_id)
+    return login(db, response, row)
 
 
 @app.post("/api/v1/auth/enterprise")
@@ -122,7 +141,10 @@ def enterprise_login(body: IdentityToken, response: Response, db=Depends(get_db,
 def demo_login(body: DemoLogin, response: Response, db=Depends(get_db, scope="function")):
     if not cfg.demo_mode:
         fail(404, "DEMO_DISABLED", "演示模式已关闭")
-    return login(db, response, find(db, DEMO_ORG, "user", key=body.role))
+    user = find(db, DEMO_ORG, "user", key=body.role)
+    if not user or user.status != "active":
+        fail(404, "DEMO_UNAVAILABLE", "账号不可用")
+    return login(db, response, user)
 
 
 @app.post("/api/v1/auth/logout")
@@ -133,7 +155,7 @@ def logout(request: Request, response: Response, db=Depends(get_db, scope="funct
         auth = find(db, org[:64], "auth", key=digest(token.encode()))
         if auth:
             db.delete(auth)
-    response.delete_cookie("maintenance_session")
+    response.delete_cookie("maintenance_session", httponly=True, samesite="strict", secure=cfg.secure_cookie)
     return {"ok": True}
 
 
